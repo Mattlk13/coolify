@@ -4,7 +4,7 @@
     <form class="flex flex-col gap-2" wire:submit='loadBranch'>
         <div class="flex flex-col gap-2">
             <div class="flex flex-col gap-2">
-                <div class="flex items-end gap-2">
+                <div class="flex gap-2 items-end">
                     <x-forms.input required id="repository_url" label="Repository URL (https://)"
                         helper="{!! __('repository.url') !!}" />
                     <x-forms.button type="submit">
@@ -47,20 +47,26 @@
                         @if ($build_pack === 'dockercompose')
                             <x-forms.input placeholder="/" wire:model.blur="base_directory" label="Base Directory"
                                 helper="Directory to use as root. Useful for monorepos." />
-                            <x-forms.input placeholder="/docker-compose.yaml" id="docker_compose_location"
+                            <x-forms.input placeholder="/docker-compose.yaml" wire:model.blur="docker_compose_location"
                                 label="Docker Compose Location"
                                 helper="It is calculated together with the Base Directory:<br><span class='dark:text-warning'>{{ Str::start($base_directory . $docker_compose_location, '/') }}</span>" />
                             Compose file location in your repository:<span
                                 class='dark:text-warning'>{{ Str::start($base_directory . $docker_compose_location, '/') }}</span>
+                        @else
+                            <x-forms.input wire:model="base_directory" label="Base Directory"
+                                helper="Directory to use as root. Useful for monorepos." />
                         @endif
                         @if ($show_is_static)
                             <x-forms.input type="number" id="port" label="Port" :readonly="$isStatic || $build_pack === 'static'"
                                 helper="The port your application listens on." />
-                            <div class="w-52">
+                            <div class="w-64">
                                 <x-forms.checkbox instantSave id="isStatic" label="Is it a static site?"
                                     helper="If your application is a static site or the final build assets should be served as a static site, enable this." />
                             </div>
                         @endif
+                        {{-- <div class="w-64">
+                            <x-forms.checkbox helper="If your repository contains a coolify.json file, it will be used to configure your application." instantSave id="checkCoolifyConfig" label="Use coolify.json if exists?" />
+                        </div> --}}
                         {{-- @if ($build_pack === 'dockercompose' && isDev())
                             <div class="dark:text-warning">If you choose Docker Compose based deployments, you cannot
                                 change it afterwards.</div>
