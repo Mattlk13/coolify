@@ -2,14 +2,20 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Server\DeleteServer;
 use App\Actions\Server\ValidateServer;
 use App\Enums\ProxyStatus;
 use App\Enums\ProxyTypes;
 use App\Http\Controllers\Controller;
+use App\Jobs\DeleteResourceJob;
+use App\Jobs\ValidateAndInstallServerJob;
 use App\Models\Application;
 use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server as ModelsServer;
+use App\Rules\ValidServerIp;
+use App\Support\ValidationPatterns;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use OpenApi\Attributes as OA;
 use Stringable;
@@ -18,25 +24,30 @@ class ServersController extends Controller
 {
     private function removeSensitiveDataFromSettings($settings)
     {
-        $token = auth()->user()->currentAccessToken();
-        if ($token->can('view:sensitive')) {
-            return serializeApiResponse($settings);
+        if (request()->attributes->get('can_read_sensitive', false) === true) {
+            $settings = $settings->makeVisible([
+                'sentinel_token',
+                'sentinel_custom_url',
+                'logdrain_newrelic_license_key',
+                'logdrain_axiom_api_key',
+                'logdrain_custom_config',
+                'logdrain_custom_config_parser',
+            ]);
         }
-        $settings = $settings->makeHidden([
-            'metrics_token',
-        ]);
 
         return serializeApiResponse($settings);
     }
 
     private function removeSensitiveData($server)
     {
-        $token = auth()->user()->currentAccessToken();
         $server->makeHidden([
             'id',
         ]);
-        if ($token->can('view:sensitive')) {
-            return serializeApiResponse($server);
+        if (request()->attributes->get('can_read_sensitive', false) === true) {
+            $server->makeVisible([
+                'logdrain_axiom_api_key',
+                'logdrain_newrelic_license_key',
+            ]);
         }
 
         return serializeApiResponse($server);
@@ -46,6 +57,7 @@ class ServersController extends Controller
         summary: 'List',
         description: 'List all servers.',
         path: '/servers',
+        operationId: 'list-servers',
         security: [
             ['bearerAuth' => []],
         ],
@@ -100,12 +112,13 @@ class ServersController extends Controller
         summary: 'Get',
         description: 'Get server by UUID.',
         path: '/servers/{uuid}',
+        operationId: 'get-server-by-uuid',
         security: [
             ['bearerAuth' => []],
         ],
         tags: ['Servers'],
         parameters: [
-            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server\'s Uuid', schema: new OA\Schema(type: 'string')),
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server\'s UUID', schema: new OA\Schema(type: 'string')),
         ],
         responses: [
             new OA\Response(
@@ -144,6 +157,7 @@ class ServersController extends Controller
         if (is_null($server)) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
+        $this->authorize('view', $server);
         if ($with_resources) {
             $server['resources'] = $server->definedResources()->map(function ($resource) {
                 $payload = [
@@ -154,11 +168,7 @@ class ServersController extends Controller
                     'created_at' => $resource->created_at,
                     'updated_at' => $resource->updated_at,
                 ];
-                if ($resource->type() === 'service') {
-                    $payload['status'] = $resource->status();
-                } else {
-                    $payload['status'] = $resource->status;
-                }
+                $payload['status'] = $resource->status;
 
                 return $payload;
             });
@@ -177,12 +187,13 @@ class ServersController extends Controller
         summary: 'Resources',
         description: 'Get resources by server.',
         path: '/servers/{uuid}/resources',
+        operationId: 'get-resources-by-server-uuid',
         security: [
             ['bearerAuth' => []],
         ],
         tags: ['Servers'],
         parameters: [
-            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server\'s Uuid', schema: new OA\Schema(type: 'string')),
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server\'s UUID', schema: new OA\Schema(type: 'string')),
         ],
         responses: [
             new OA\Response(
@@ -236,16 +247,11 @@ class ServersController extends Controller
                 'created_at' => $resource->created_at,
                 'updated_at' => $resource->updated_at,
             ];
-            if ($resource->type() === 'service') {
-                $payload['status'] = $resource->status();
-            } else {
-                $payload['status'] = $resource->status;
-            }
+            $payload['status'] = $resource->status;
 
             return $payload;
         });
         $server = $this->removeSensitiveData($server);
-        ray($server);
 
         return response()->json(serializeApiResponse(data_get($server, 'resources')));
     }
@@ -254,12 +260,13 @@ class ServersController extends Controller
         summary: 'Domains',
         description: 'Get domains by server.',
         path: '/servers/{uuid}/domains',
+        operationId: 'get-domains-by-server-uuid',
         security: [
             ['bearerAuth' => []],
         ],
         tags: ['Servers'],
         parameters: [
-            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server\'s Uuid', schema: new OA\Schema(type: 'string')),
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server\'s UUID', schema: new OA\Schema(type: 'string')),
         ],
         responses: [
             new OA\Response(
@@ -295,16 +302,25 @@ class ServersController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
-        $uuid = $request->get('uuid');
+        $server = ModelsServer::whereTeamId($teamId)->whereUuid($request->uuid)->first();
+        if (is_null($server)) {
+            return response()->json(['message' => 'Server not found.'], 404);
+        }
+        $uuid = $request->query('uuid');
         if ($uuid) {
-            $domains = Application::getDomainsByUuid($uuid);
+            $application = Application::ownedByCurrentTeamAPI($teamId)->where('uuid', $uuid)->first();
+            if (! $application) {
+                return response()->json(['message' => 'Application not found.'], 404);
+            }
 
-            return response()->json(serializeApiResponse($domains));
+            return response()->json(serializeApiResponse($application->fqdns));
         }
         $projects = Project::where('team_id', $teamId)->get();
         $domains = collect();
-        $applications = $projects->pluck('applications')->flatten();
-        $settings = \App\Models\InstanceSettings::get();
+        $applications = $projects->pluck('applications')->flatten()->filter(function ($application) use ($server) {
+            return $application->destination?->server?->id === $server->id;
+        });
+        $settings = instanceSettings();
         if ($applications->count() > 0) {
             foreach ($applications as $application) {
                 $ip = $application->destination->server->ip;
@@ -343,7 +359,9 @@ class ServersController extends Controller
                 }
             }
         }
-        $services = $projects->pluck('services')->flatten();
+        $services = $projects->pluck('services')->flatten()->filter(function ($service) use ($server) {
+            return $service->server_id === $server->id;
+        });
         if ($services->count() > 0) {
             foreach ($services as $service) {
                 $service_applications = $service->applications;
@@ -356,7 +374,8 @@ class ServersController extends Controller
                         })->filter(function (Stringable $fqdn) {
                             return $fqdn->isNotEmpty();
                         });
-                        if ($ip === 'host.docker.internal') {
+                        $serviceIp = $server->ip;
+                        if ($serviceIp === 'host.docker.internal') {
                             if ($settings->public_ipv4) {
                                 $domains->push([
                                     'domain' => $fqdn,
@@ -372,13 +391,13 @@ class ServersController extends Controller
                             if (! $settings->public_ipv4 && ! $settings->public_ipv6) {
                                 $domains->push([
                                     'domain' => $fqdn,
-                                    'ip' => $ip,
+                                    'ip' => $serviceIp,
                                 ]);
                             }
                         } else {
                             $domains->push([
                                 'domain' => $fqdn,
-                                'ip' => $ip,
+                                'ip' => $serviceIp,
                             ]);
                         }
                     }
@@ -401,6 +420,7 @@ class ServersController extends Controller
         summary: 'Create',
         description: 'Create Server.',
         path: '/servers',
+        operationId: 'create-server',
         security: [
             ['bearerAuth' => []],
         ],
@@ -421,6 +441,7 @@ class ServersController extends Controller
                         'private_key_uuid' => ['type' => 'string', 'example' => 'og888os', 'description' => 'The UUID of the private key.'],
                         'is_build_server' => ['type' => 'boolean', 'example' => false, 'description' => 'Is build server.'],
                         'instant_validate' => ['type' => 'boolean', 'example' => false, 'description' => 'Instant validate.'],
+                        'proxy_type' => ['type' => 'string', 'enum' => ['traefik', 'caddy', 'none'], 'example' => 'traefik', 'description' => 'The proxy type.'],
                     ],
                 ),
             ),
@@ -452,30 +473,38 @@ class ServersController extends Controller
                 response: 404,
                 ref: '#/components/responses/404',
             ),
+            new OA\Response(
+                response: 422,
+                ref: '#/components/responses/422',
+            ),
         ]
     )]
     public function create_server(Request $request)
     {
-        $allowedFields = ['name', 'description', 'ip', 'port', 'user', 'private_key_uuid', 'is_build_server', 'instant_validate'];
+        $allowedFields = ['name', 'description', 'ip', 'port', 'user', 'private_key_uuid', 'is_build_server', 'instant_validate', 'proxy_type'];
 
         $teamId = getTeamIdFromToken();
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
+        $this->authorize('create', [ModelsServer::class]);
 
         $return = validateIncomingRequest($request);
-        if ($return instanceof \Illuminate\Http\JsonResponse) {
+        if ($return instanceof JsonResponse) {
             return $return;
         }
         $validator = customApiValidator($request->all(), [
             'name' => 'string|max:255',
             'description' => 'string|nullable',
-            'ip' => 'string|required',
-            'port' => 'integer|nullable',
+            'ip' => ['string', 'required', new ValidServerIp],
+            'port' => 'integer|nullable|between:1,65535',
             'private_key_uuid' => 'string|required',
-            'user' => 'string|nullable',
+            'user' => ValidationPatterns::serverUsernameRules(required: false),
             'is_build_server' => 'boolean|nullable',
             'instant_validate' => 'boolean|nullable',
+            'proxy_type' => 'string|nullable',
+        ], [
+            ...ValidationPatterns::serverUsernameMessages(),
         ]);
 
         $extraFields = array_diff(array_keys($request->all()), $allowedFields);
@@ -507,14 +536,24 @@ class ServersController extends Controller
         if (is_null($request->instant_validate)) {
             $request->offsetSet('instant_validate', false);
         }
+        if ($request->proxy_type) {
+            $validProxyTypes = collect(ProxyTypes::cases())->map(function ($proxyType) {
+                return str($proxyType->value)->lower();
+            });
+            if (! $validProxyTypes->contains(str($request->proxy_type)->lower())) {
+                return response()->json(['message' => 'Invalid proxy type.'], 422);
+            }
+        }
         $privateKey = PrivateKey::whereTeamId($teamId)->whereUuid($request->private_key_uuid)->first();
         if (! $privateKey) {
             return response()->json(['message' => 'Private key not found.'], 404);
         }
-        $allServers = ModelsServer::whereIp($request->ip)->get();
-        if ($allServers->count() > 0) {
-            return response()->json(['message' => 'Server with this IP already exists.'], 400);
+        $foundServer = ModelsServer::whereIp($request->ip)->first();
+        if ($foundServer) {
+            return response()->json(['message' => 'A server with this IP/Domain is already in use.'], 400);
         }
+
+        $proxyType = $request->proxy_type ? str($request->proxy_type)->upper() : ProxyTypes::TRAEFIK->value;
 
         $server = ModelsServer::create([
             'name' => $request->name,
@@ -524,17 +563,25 @@ class ServersController extends Controller
             'user' => $request->user,
             'private_key_id' => $privateKey->id,
             'team_id' => $teamId,
-            'proxy' => [
-                'type' => ProxyTypes::TRAEFIK->value,
-                'status' => ProxyStatus::EXITED->value,
-            ],
         ]);
+        $server->proxy->set('type', $proxyType);
+        $server->proxy->set('status', ProxyStatus::EXITED->value);
+        $server->save();
+
         $server->settings()->update([
             'is_build_server' => $request->is_build_server,
         ]);
         if ($request->instant_validate) {
             ValidateServer::dispatch($server);
         }
+
+        auditLog('api.server.created', [
+            'team_id' => $teamId,
+            'server_uuid' => $server->uuid,
+            'server_name' => $server->name,
+            'ip' => $server->ip,
+            'is_build_server' => (bool) $request->is_build_server,
+        ]);
 
         return response()->json([
             'uuid' => $server->uuid,
@@ -545,10 +592,14 @@ class ServersController extends Controller
         summary: 'Update',
         description: 'Update Server.',
         path: '/servers/{uuid}',
+        operationId: 'update-server-by-uuid',
         security: [
             ['bearerAuth' => []],
         ],
         tags: ['Servers'],
+        parameters: [
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server UUID', schema: new OA\Schema(type: 'string')),
+        ],
         requestBody: new OA\RequestBody(
             required: true,
             description: 'Server updated.',
@@ -565,6 +616,13 @@ class ServersController extends Controller
                         'private_key_uuid' => ['type' => 'string', 'description' => 'The UUID of the private key.'],
                         'is_build_server' => ['type' => 'boolean', 'description' => 'Is build server.'],
                         'instant_validate' => ['type' => 'boolean', 'description' => 'Instant validate.'],
+                        'proxy_type' => ['type' => 'string', 'enum' => ['traefik', 'caddy', 'none'], 'description' => 'The proxy type.'],
+                        'concurrent_builds' => ['type' => 'integer', 'description' => 'Number of concurrent builds.'],
+                        'dynamic_timeout' => ['type' => 'integer', 'description' => 'Deployment timeout in seconds.'],
+                        'deployment_queue_limit' => ['type' => 'integer', 'description' => 'Maximum number of queued deployments.'],
+                        'server_disk_usage_notification_threshold' => ['type' => 'integer', 'description' => 'Server disk usage notification threshold (%).'],
+                        'server_disk_usage_check_frequency' => ['type' => 'string', 'description' => 'Cron expression for disk usage check frequency.'],
+                        'connection_timeout' => ['type' => 'integer', 'description' => 'SSH connection timeout in seconds (1-300). Default: 10.'],
                     ],
                 ),
             ),
@@ -577,8 +635,7 @@ class ServersController extends Controller
                     new OA\MediaType(
                         mediaType: 'application/json',
                         schema: new OA\Schema(
-                            type: 'array',
-                            items: new OA\Items(ref: '#/components/schemas/Server')
+                            ref: '#/components/schemas/Server'
                         )
                     ),
                 ]),
@@ -594,11 +651,15 @@ class ServersController extends Controller
                 response: 404,
                 ref: '#/components/responses/404',
             ),
+            new OA\Response(
+                response: 422,
+                ref: '#/components/responses/422',
+            ),
         ]
     )]
     public function update_server(Request $request)
     {
-        $allowedFields = ['name', 'description', 'ip', 'port', 'user', 'private_key_uuid', 'is_build_server', 'instant_validate'];
+        $allowedFields = ['name', 'description', 'ip', 'port', 'user', 'private_key_uuid', 'is_build_server', 'instant_validate', 'proxy_type', 'concurrent_builds', 'dynamic_timeout', 'deployment_queue_limit', 'server_disk_usage_notification_threshold', 'server_disk_usage_check_frequency', 'connection_timeout', 'is_terminal_enabled'];
 
         $teamId = getTeamIdFromToken();
         if (is_null($teamId)) {
@@ -606,18 +667,28 @@ class ServersController extends Controller
         }
 
         $return = validateIncomingRequest($request);
-        if ($return instanceof \Illuminate\Http\JsonResponse) {
+        if ($return instanceof JsonResponse) {
             return $return;
         }
         $validator = customApiValidator($request->all(), [
             'name' => 'string|max:255|nullable',
             'description' => 'string|nullable',
-            'ip' => 'string|nullable',
-            'port' => 'integer|nullable',
+            'ip' => ['string', 'nullable', new ValidServerIp],
+            'port' => 'integer|nullable|between:1,65535',
             'private_key_uuid' => 'string|nullable',
-            'user' => 'string|nullable',
+            'user' => ValidationPatterns::serverUsernameRules(required: false),
             'is_build_server' => 'boolean|nullable',
             'instant_validate' => 'boolean|nullable',
+            'proxy_type' => 'string|nullable',
+            'concurrent_builds' => 'integer|min:1',
+            'dynamic_timeout' => 'integer|min:1',
+            'deployment_queue_limit' => 'integer|min:1',
+            'server_disk_usage_notification_threshold' => 'integer|min:1|max:100',
+            'server_disk_usage_check_frequency' => 'string',
+            'connection_timeout' => 'integer|min:1|max:300',
+            'is_terminal_enabled' => 'boolean|nullable',
+        ], [
+            ...ValidationPatterns::serverUsernameMessages(),
         ]);
 
         $extraFields = array_diff(array_keys($request->all()), $allowedFields);
@@ -638,23 +709,81 @@ class ServersController extends Controller
         if (! $server) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
-        $server->update($request->only(['name', 'description', 'ip', 'port', 'user']));
-        if ($request->is_build_server) {
+        $this->authorize('update', $server);
+        if ($request->proxy_type) {
+            $validProxyTypes = collect(ProxyTypes::cases())->map(function ($proxyType) {
+                return str($proxyType->value)->lower();
+            });
+            if (! $validProxyTypes->contains(str($request->proxy_type)->lower())) {
+                return response()->json(['message' => 'Invalid proxy type.'], 422);
+            }
+        }
+        $updateFields = $request->only(['name', 'description', 'ip', 'port', 'user']);
+        if ($request->filled('private_key_uuid')) {
+            $privateKey = PrivateKey::whereTeamId($teamId)->whereUuid($request->private_key_uuid)->first();
+            if (! $privateKey) {
+                return response()->json(['message' => 'Private key not found.'], 404);
+            }
+            $updateFields['private_key_id'] = $privateKey->id;
+        }
+
+        if ($request->has('server_disk_usage_check_frequency') && ! validate_cron_expression($request->server_disk_usage_check_frequency)) {
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => ['server_disk_usage_check_frequency' => ['Invalid Cron / Human expression for Disk Usage Check Frequency.']],
+            ], 422);
+        }
+
+        if ($request->boolean('is_build_server') && ! $server->isBuildServer() && ! $server->isEmpty()) {
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => ['is_build_server' => ['A server with existing resources cannot be configured as a build server.']],
+            ], 422);
+        }
+
+        $server->update($updateFields);
+        if ($request->has('is_build_server')) {
             $server->settings()->update([
-                'is_build_server' => $request->is_build_server,
+                'is_build_server' => $request->boolean('is_build_server'),
             ]);
         }
+
+        if ($request->has('is_terminal_enabled')) {
+            $server->settings()->update([
+                'is_terminal_enabled' => $request->boolean('is_terminal_enabled'),
+            ]);
+        }
+
+        $advancedSettings = $request->only(['concurrent_builds', 'dynamic_timeout', 'deployment_queue_limit', 'server_disk_usage_notification_threshold', 'server_disk_usage_check_frequency', 'connection_timeout']);
+        if (! empty($advancedSettings)) {
+            $server->settings()->update(array_filter($advancedSettings, fn ($value) => ! is_null($value)));
+        }
+
+        if ($request->proxy_type) {
+            $server->changeProxy($request->proxy_type, async: true);
+        }
+
         if ($request->instant_validate) {
             ValidateServer::dispatch($server);
         }
 
-        return response()->json(serializeApiResponse($server))->setStatusCode(201);
+        auditLog('api.server.updated', [
+            'team_id' => $teamId,
+            'server_uuid' => $server->uuid,
+            'server_name' => $server->name,
+            'changed_fields' => array_values(array_intersect($allowedFields, array_keys($request->all()))),
+        ]);
+
+        return response()->json([
+            'uuid' => $server->uuid,
+        ])->setStatusCode(201);
     }
 
     #[OA\Delete(
         summary: 'Delete',
         description: 'Delete server by UUID.',
         path: '/servers/{uuid}',
+        operationId: 'delete-server-by-uuid',
         security: [
             ['bearerAuth' => []],
         ],
@@ -667,7 +796,6 @@ class ServersController extends Controller
                 required: true,
                 schema: new OA\Schema(
                     type: 'string',
-                    format: 'uuid',
                 )
             ),
         ],
@@ -698,6 +826,10 @@ class ServersController extends Controller
                 response: 404,
                 ref: '#/components/responses/404',
             ),
+            new OA\Response(
+                response: 422,
+                ref: '#/components/responses/422',
+            ),
         ]
     )]
     public function delete_server(Request $request)
@@ -715,18 +847,55 @@ class ServersController extends Controller
         if (! $server) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
-        if ($server->definedResources()->count() > 0) {
-            return response()->json(['message' => 'Server has resources, so you need to delete them before.'], 400);
+        $this->authorize('delete', $server);
+
+        $force = filter_var($request->query('force', false), FILTER_VALIDATE_BOOLEAN);
+
+        if ($server->definedResources()->count() > 0 && ! $force) {
+            return response()->json(['message' => 'Server has resources. Use ?force=true to delete all resources and the server, or delete resources manually first.'], 400);
         }
+        if ($server->is_coolify_host) {
+            return response()->json(['message' => 'Local server cannot be deleted.'], 400);
+        }
+
+        if ($force) {
+            foreach ($server->definedResources() as $resource) {
+                DeleteResourceJob::dispatch($resource);
+            }
+        }
+
+        $deletedUuid = $server->uuid;
+        $deletedName = $server->name;
+        $deletedIp = $server->ip;
         $server->delete();
+        DeleteServer::dispatch(
+            $server->id,
+            false, // Don't delete from Hetzner via API
+            $server->hetzner_server_id,
+            $server->cloud_provider_token_id,
+            $server->team_id,
+            false, // Don't delete from Vultr via API
+            $server->vultr_instance_id,
+            false, // Don't delete from DigitalOcean via API
+            $server->digitalocean_droplet_id
+        );
+
+        auditLog('api.server.deleted', [
+            'team_id' => $teamId,
+            'server_uuid' => $deletedUuid,
+            'server_name' => $deletedName,
+            'ip' => $deletedIp,
+            'force' => $force,
+        ]);
 
         return response()->json(['message' => 'Server deleted.']);
     }
 
-    #[OA\Get(
+    #[OA\Post(
         summary: 'Validate',
         description: 'Validate server by UUID.',
         path: '/servers/{uuid}/validate',
+        operationId: 'validate-server-by-uuid',
         security: [
             ['bearerAuth' => []],
         ],
@@ -734,6 +903,19 @@ class ServersController extends Controller
         parameters: [
             new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server UUID', schema: new OA\Schema(type: 'string')),
         ],
+        requestBody: new OA\RequestBody(
+            required: false,
+            content: new OA\JsonContent(
+                properties: [
+                    new OA\Property(
+                        property: 'install',
+                        description: 'Install missing prerequisites and Docker. This can restart the Docker daemon.',
+                        type: 'boolean',
+                        default: false,
+                    ),
+                ],
+            ),
+        ),
         responses: [
             new OA\Response(
                 response: 201,
@@ -761,6 +943,10 @@ class ServersController extends Controller
                 response: 404,
                 ref: '#/components/responses/404',
             ),
+            new OA\Response(
+                response: 422,
+                ref: '#/components/responses/422',
+            ),
         ]
     )]
     public function validate_server(Request $request)
@@ -778,8 +964,40 @@ class ServersController extends Controller
         if (! $server) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
-        ValidateServer::dispatch($server);
+        $this->authorize('update', $server);
 
-        return response()->json(['message' => 'Validation started.']);
+        if (! $server->canBeValidated()) {
+            return response()->json([
+                'message' => 'This server was transferred to another Coolify instance and cannot be revalidated here.',
+            ], 422);
+        }
+
+        $validator = customApiValidator($request->all(), [
+            'install' => 'boolean',
+        ]);
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $install = $request->boolean('install', false);
+        if ($install) {
+            ValidateAndInstallServerJob::dispatch($server);
+        } else {
+            ValidateServer::dispatch($server);
+        }
+
+        auditLog('api.server.validated', [
+            'team_id' => $teamId,
+            'server_uuid' => $server->uuid,
+            'server_name' => $server->name,
+            'install' => $install,
+        ]);
+
+        $message = $install ? 'Validation and installation started.' : 'Validation started.';
+
+        return response()->json(['message' => $message], 201);
     }
 }

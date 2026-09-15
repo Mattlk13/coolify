@@ -2,6 +2,8 @@
 
 namespace App\Jobs;
 
+use App\Enums\ApplicationDeploymentStatus;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
@@ -17,22 +19,64 @@ class CleanupHelperContainersJob implements ShouldBeEncrypted, ShouldBeUnique, S
 
     public function __construct(public Server $server) {}
 
+    private static function helperContainersCommand(): string
+    {
+        return 'docker container ps --format \'{{json .}}\' | jq -s \'map(select(.Image|test("(^|/)coollabsio/coolify-helper(:|@)")))\'';
+    }
+
     public function handle(): void
     {
         try {
-            ray('Cleaning up helper containers on '.$this->server->name);
-            $containers = instant_remote_process(['docker container ps --filter "ancestor=ghcr.io/coollabsio/coolify-helper:next" --filter "ancestor=ghcr.io/coollabsio/coolify-helper:latest" --format \'{{json .}}\''], $this->server, false);
-            $containers = format_docker_command_output_to_json($containers);
-            if ($containers->count() > 0) {
-                foreach ($containers as $container) {
+            // Get all active deployments on this server
+            $activeDeployments = ApplicationDeploymentQueue::where('server_id', $this->server->id)
+                ->whereIn('status', [
+                    ApplicationDeploymentStatus::IN_PROGRESS->value,
+                    ApplicationDeploymentStatus::QUEUED->value,
+                ])
+                ->pluck('deployment_uuid')
+                ->toArray();
+
+            \Log::info('CleanupHelperContainersJob - Active deployments', [
+                'server' => $this->server->name,
+                'active_deployment_uuids' => $activeDeployments,
+            ]);
+
+            $containers = instant_remote_process_with_timeout([self::helperContainersCommand()], $this->server, false);
+            $helperContainers = collect(json_decode($containers));
+
+            if ($helperContainers->count() > 0) {
+                foreach ($helperContainers as $container) {
                     $containerId = data_get($container, 'ID');
-                    ray('Removing container '.$containerId);
-                    instant_remote_process(['docker container rm -f '.$containerId], $this->server, false);
+                    $containerName = data_get($container, 'Names');
+
+                    // Check if this container belongs to an active deployment
+                    $isActiveDeployment = false;
+                    foreach ($activeDeployments as $deploymentUuid) {
+                        if (str_contains($containerName, $deploymentUuid)) {
+                            $isActiveDeployment = true;
+                            break;
+                        }
+                    }
+
+                    if ($isActiveDeployment) {
+                        \Log::info('CleanupHelperContainersJob - Skipping active deployment container', [
+                            'container' => $containerName,
+                            'id' => $containerId,
+                        ]);
+
+                        continue;
+                    }
+
+                    \Log::info('CleanupHelperContainersJob - Removing orphaned helper container', [
+                        'container' => $containerName,
+                        'id' => $containerId,
+                    ]);
+
+                    instant_remote_process_with_timeout(['docker container rm -f '.$containerId], $this->server, false);
                 }
             }
         } catch (\Throwable $e) {
             send_internal_notification('CleanupHelperContainersJob failed with error: '.$e->getMessage());
-            ray($e->getMessage());
         }
     }
 }

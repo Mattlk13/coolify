@@ -1,31 +1,20 @@
-<div class="pb-5">
-    <h1>Settings</h1>
-    <div class="subtitle">Instance wide settings for Coolify.</div>
-    <div class="navbar-main">
-        <nav class="flex items-center gap-6 min-h-10 whitespace-nowrap">
-            <a class="{{ request()->routeIs('settings.index') ? 'dark:text-white' : '' }}"
-                href="{{ route('settings.index') }}">
-                <button>Configuration</button>
-            </a>
-            @if (isCloud())
-                <a class="{{ request()->routeIs('settings.license') ? 'dark:text-white' : '' }}"
-                    href="{{ route('settings.license') }}">
-                    <button>Resale License</button>
-                </a>
-            @endif
-            <a class="{{ request()->routeIs('settings.backup') ? 'dark:text-white' : '' }}"
-                href="{{ route('settings.backup') }}">
-                <button>Backup</button>
-            </a>
-            <a class="{{ request()->routeIs('settings.email') ? 'dark:text-white' : '' }}"
-                href="{{ route('settings.email') }}">
-                <button>Transactional Email</button>
-            </a>
-            <a class="{{ request()->routeIs('settings.oauth') ? 'dark:text-white' : '' }}"
-                href="{{ route('settings.oauth') }}">
-                <button>OAuth</button>
-            </a>
-            <div class="flex-1"></div>
-        </nav>
-    </div>
+@props([
+    'title' => 'Settings',
+    'subtitle' => 'Instance configuration and maintenance',
+])
+
+{{-- Same 1180px shell as the workspace. Title hidden only at xl+ (full desktop). --}}
+<div class="mx-auto w-full max-w-none">
+    <x-dashboard.navbar section="settings" :title="$title" :subtitle="$subtitle" :titleOnDesktop="false">
+        @isset($titleActions)
+            <x-slot:titleActions>
+                {{ $titleActions }}
+            </x-slot:titleActions>
+        @endisset
+        @isset($actions)
+            <x-slot:actions>
+                {{ $actions }}
+            </x-slot:actions>
+        @endisset
+    </x-dashboard.navbar>
 </div>

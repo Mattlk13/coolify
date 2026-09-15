@@ -2,11 +2,14 @@
 
 namespace App\Livewire\Project\Shared;
 
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
 
 // Refactored ✅
 class Webhooks extends Component
 {
+    use AuthorizesRequests;
+
     public $resource;
 
     public ?string $deploywebhook;
@@ -29,21 +32,24 @@ class Webhooks extends Component
 
     public function mount()
     {
-        // ray()->clearAll();
-        // ray()->showQueries();
         $this->deploywebhook = generateDeployWebhook($this->resource);
 
-        $this->githubManualWebhookSecret = data_get($this->resource, 'manual_webhook_secret_github');
+        if ($this->canViewSecrets()) {
+            $this->githubManualWebhookSecret = data_get($this->resource, 'manual_webhook_secret_github');
+            $this->gitlabManualWebhookSecret = data_get($this->resource, 'manual_webhook_secret_gitlab');
+            $this->bitbucketManualWebhookSecret = data_get($this->resource, 'manual_webhook_secret_bitbucket');
+            $this->giteaManualWebhookSecret = data_get($this->resource, 'manual_webhook_secret_gitea');
+        }
+
         $this->githubManualWebhook = generateGitManualWebhook($this->resource, 'github');
-
-        $this->gitlabManualWebhookSecret = data_get($this->resource, 'manual_webhook_secret_gitlab');
         $this->gitlabManualWebhook = generateGitManualWebhook($this->resource, 'gitlab');
-
-        $this->bitbucketManualWebhookSecret = data_get($this->resource, 'manual_webhook_secret_bitbucket');
         $this->bitbucketManualWebhook = generateGitManualWebhook($this->resource, 'bitbucket');
-
-        $this->giteaManualWebhookSecret = data_get($this->resource, 'manual_webhook_secret_gitea');
         $this->giteaManualWebhook = generateGitManualWebhook($this->resource, 'gitea');
+    }
+
+    public function canViewSecrets(): bool
+    {
+        return auth()->user()->can('update', $this->resource);
     }
 
     public function submit()
@@ -56,7 +62,7 @@ class Webhooks extends Component
                 'manual_webhook_secret_bitbucket' => $this->bitbucketManualWebhookSecret,
                 'manual_webhook_secret_gitea' => $this->giteaManualWebhookSecret,
             ]);
-            $this->dispatch('success', 'Secret Saved.');
+            $this->dispatch('success', 'Webhook secrets saved.');
         } catch (\Exception $e) {
             return handleError($e, $this);
         }

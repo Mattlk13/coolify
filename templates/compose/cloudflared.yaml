@@ -1,5 +1,6 @@
 # documentation: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
 # slogan: Client for Cloudflare Tunnel, a daemon that exposes private services through the Cloudflare edge.
+# category: proxy
 # logo: svgs/cloudflared.svg
 
 services:
@@ -7,6 +8,12 @@ services:
     container_name: cloudflare-tunnel
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
-    command: tunnel run
+    network_mode: host
+    command: tunnel --no-autoupdate run
     environment:
-      - TUNNEL_TOKEN=$CLOUDFLARE_TUNNEL_TOKEN
+      - 'TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}'
+    healthcheck:
+      test: ["CMD", "cloudflared", "--version"]
+      interval: 5s
+      timeout: 20s
+      retries: 10

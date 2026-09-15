@@ -11,11 +11,30 @@ class OauthSetting extends Model
 {
     use HasFactory;
 
+    protected $fillable = ['provider', 'client_id', 'client_secret', 'redirect_uri', 'tenant', 'base_url', 'enabled'];
+
+    protected $hidden = [
+        'client_secret',
+    ];
+
     protected function clientSecret(): Attribute
     {
         return Attribute::make(
             get: fn (?string $value) => empty($value) ? null : Crypt::decryptString($value),
             set: fn (?string $value) => empty($value) ? null : Crypt::encryptString($value),
         );
+    }
+
+    public function couldBeEnabled(): bool
+    {
+        switch ($this->provider) {
+            case 'azure':
+                return filled($this->client_id) && filled($this->client_secret) && filled($this->tenant);
+            case 'authentik':
+            case 'clerk':
+                return filled($this->client_id) && filled($this->client_secret) && filled($this->base_url);
+            default:
+                return filled($this->client_id) && filled($this->client_secret);
+        }
     }
 }

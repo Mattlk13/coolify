@@ -3,53 +3,51 @@
 namespace App\Actions\Service;
 
 use App\Models\Service;
-use Lorisleiva\Actions\Concerns\AsAction;
 
 class DeleteService
 {
-    use AsAction;
-
-    public function handle(Service $service)
+    public function cleanupRemote(Service $service, bool $deleteVolumes, bool $deleteConnectedNetworks, bool $deleteConfigurations): void
     {
-        try {
-            $server = data_get($service, 'server');
-            if ($server->isFunctional()) {
-                $storagesToDelete = collect([]);
-
-                $service->environment_variables()->delete();
-                $commands = [];
-                foreach ($service->applications()->get() as $application) {
-                    $storages = $application->persistentStorages()->get();
-                    foreach ($storages as $storage) {
-                        $storagesToDelete->push($storage);
-                    }
-                }
-                foreach ($service->databases()->get() as $database) {
-                    $storages = $database->persistentStorages()->get();
-                    foreach ($storages as $storage) {
-                        $storagesToDelete->push($storage);
-                    }
-                }
-                foreach ($storagesToDelete as $storage) {
-                    $commands[] = "docker volume rm -f $storage->name";
-                }
-                $commands[] = "docker rm -f $service->uuid";
-
-                instant_remote_process($commands, $server, false);
-            }
-        } catch (\Exception $e) {
-            throw new \Exception($e->getMessage());
-        } finally {
+        $server = data_get($service, 'server');
+        if ($deleteVolumes && $server->isFunctional()) {
+            $commands = [];
             foreach ($service->applications()->get() as $application) {
-                $application->forceDelete();
+                foreach ($application->persistentStorages()->get() as $storage) {
+                    $commands[] = 'docker volume rm -f '.escapeshellarg($storage->name);
+                }
             }
             foreach ($service->databases()->get() as $database) {
-                $database->forceDelete();
+                foreach ($database->persistentStorages()->get() as $storage) {
+                    $commands[] = 'docker volume rm -f '.escapeshellarg($storage->name);
+                }
             }
-            foreach ($service->scheduled_tasks as $task) {
-                $task->delete();
+            foreach ($commands as $command) {
+                instant_remote_process([$command], $server, false);
             }
-            $service->tags()->detach();
         }
+
+        if ($deleteConnectedNetworks) {
+            $service->deleteConnectedNetworks();
+        }
+        if ($deleteConfigurations) {
+            $service->deleteConfigurations();
+        }
+        instant_remote_process(["docker rm -f $service->uuid"], $server, throwError: false);
+    }
+
+    public function deleteLocal(Service $service): void
+    {
+        foreach ($service->applications()->get() as $application) {
+            $application->forceDelete();
+        }
+        foreach ($service->databases()->get() as $database) {
+            $database->forceDelete();
+        }
+        foreach ($service->scheduled_tasks as $task) {
+            $task->delete();
+        }
+        $service->environment_variables()->delete();
+        $service->tags()->detach();
+        $service->forceDelete();
     }
 }

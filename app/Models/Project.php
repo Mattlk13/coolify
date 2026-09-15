@@ -2,6 +2,10 @@
 
 namespace App\Models;
 
+use App\Traits\ClearsGlobalSearchCache;
+use App\Traits\HasSafeStringAttribute;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Support\Collection;
 use OpenApi\Attributes as OA;
 
 #[OA\Schema(
@@ -11,21 +15,39 @@ use OpenApi\Attributes as OA;
         'id' => ['type' => 'integer'],
         'uuid' => ['type' => 'string'],
         'name' => ['type' => 'string'],
-        'environments' => new OA\Property(
-            property: 'environments',
-            type: 'array',
-            items: new OA\Items(ref: '#/components/schemas/Environment'),
-            description: 'The environments of the project.'
-        ),
+        'description' => ['type' => 'string'],
     ]
 )]
 class Project extends BaseModel
 {
-    protected $guarded = [];
+    use ClearsGlobalSearchCache;
+    use HasFactory;
+    use HasSafeStringAttribute;
 
+    protected $fillable = [
+        'name',
+        'description',
+        'team_id',
+        'uuid',
+    ];
+
+    /**
+     * Get query builder for projects owned by current team.
+     * If you need all projects without further query chaining, use ownedByCurrentTeamCached() instead.
+     */
     public static function ownedByCurrentTeam()
     {
-        return Project::whereTeamId(currentTeam()->id)->orderBy('name');
+        return Project::whereTeamId(currentTeam()->id)->orderByRaw('LOWER(name)');
+    }
+
+    /**
+     * Get all projects owned by current team (cached for request duration).
+     */
+    public static function ownedByCurrentTeamCached()
+    {
+        return once(function () {
+            return Project::ownedByCurrentTeam()->get();
+        });
     }
 
     protected static function booted()
@@ -37,6 +59,7 @@ class Project extends BaseModel
             Environment::create([
                 'name' => 'production',
                 'project_id' => $project->id,
+                'uuid' => new_public_id(),
             ]);
         });
         static::deleting(function ($project) {
@@ -44,7 +67,6 @@ class Project extends BaseModel
             $project->settings()->delete();
             $shared_variables = $project->environment_variables();
             foreach ($shared_variables as $shared_variable) {
-                ray('Deleting project shared variable: '.$shared_variable->name);
                 $shared_variable->delete();
             }
         });
@@ -52,7 +74,7 @@ class Project extends BaseModel
 
     public function environment_variables()
     {
-        return $this->hasMany(SharedEnvironmentVariable::class);
+        return $this->hasMany(SharedEnvironmentVariable::class)->where('type', 'project');
     }
 
     public function environments()
@@ -120,27 +142,41 @@ class Project extends BaseModel
         return $this->hasManyThrough(StandaloneMariadb::class, Environment::class);
     }
 
-    public function resource_count()
+    public function isEmpty()
     {
-        return $this->applications()->count() + $this->postgresqls()->count() + $this->redis()->count() + $this->mongodbs()->count() + $this->mysqls()->count() + $this->mariadbs()->count() + $this->keydbs()->count() + $this->dragonflies()->count() + $this->clickhouses()->count() + $this->services()->count();
+        return $this->applications()->count() == 0 &&
+            $this->redis()->count() == 0 &&
+            $this->postgresqls()->count() == 0 &&
+            $this->mysqls()->count() == 0 &&
+            $this->keydbs()->count() == 0 &&
+            $this->dragonflies()->count() == 0 &&
+            $this->clickhouses()->count() == 0 &&
+            $this->mariadbs()->count() == 0 &&
+            $this->mongodbs()->count() == 0 &&
+            $this->services()->count() == 0;
     }
 
-    public function databases()
+    public function databases(array $with = []): Collection
     {
-        return $this->postgresqls()->get()->merge($this->redis()->get())->merge($this->mongodbs()->get())->merge($this->mysqls()->get())->merge($this->mariadbs()->get())->merge($this->keydbs()->get())->merge($this->dragonflies()->get())->merge($this->clickhouses()->get());
+        return $this->postgresqls()->with($with)->get()
+            ->concat($this->redis()->with($with)->get())
+            ->concat($this->mongodbs()->with($with)->get())
+            ->concat($this->mysqls()->with($with)->get())
+            ->concat($this->mariadbs()->with($with)->get())
+            ->concat($this->keydbs()->with($with)->get())
+            ->concat($this->dragonflies()->with($with)->get())
+            ->concat($this->clickhouses()->with($with)->get());
     }
 
-    public function default_environment()
+    public function navigateTo()
     {
-        $default = $this->environments()->where('name', 'production')->first();
-        if ($default) {
-            return $default->name;
-        }
-        $default = $this->environments()->get();
-        if ($default->count() > 0) {
-            return $default->sortBy('created_at')->first()->name;
+        if ($this->environments->count() === 1) {
+            return route('project.resource.index', [
+                'project_uuid' => $this->uuid,
+                'environment_uuid' => $this->environments->first()->uuid,
+            ]);
         }
 
-        return null;
+        return route('project.show', ['project_uuid' => $this->uuid]);
     }
 }

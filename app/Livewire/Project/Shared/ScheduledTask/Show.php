@@ -2,83 +2,189 @@
 
 namespace App\Livewire\Project\Shared\ScheduledTask;
 
+use App\Jobs\ScheduledTaskJob;
 use App\Models\Application;
-use App\Models\ScheduledTask as ModelsScheduledTask;
+use App\Models\ScheduledTask;
 use App\Models\Service;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Livewire\Attributes\Locked;
+use Livewire\Attributes\Validate;
 use Livewire\Component;
-use Visus\Cuid2\Cuid2;
 
 class Show extends Component
 {
-    public $parameters;
+    use AuthorizesRequests;
 
+    #[Locked]
     public Application|Service $resource;
 
-    public ModelsScheduledTask $task;
+    #[Locked]
+    public ScheduledTask $task;
 
-    public ?string $modalId = null;
+    #[Locked]
+    public array $parameters;
 
+    #[Locked]
     public string $type;
 
-    protected $rules = [
-        'task.enabled' => 'required|boolean',
-        'task.name' => 'required|string',
-        'task.command' => 'required|string',
-        'task.frequency' => 'required|string',
-        'task.container' => 'nullable|string',
-    ];
+    #[Validate(['boolean'])]
+    public bool $isEnabled = false;
 
-    protected $validationAttributes = [
-        'name' => 'name',
-        'command' => 'command',
-        'frequency' => 'frequency',
-        'container' => 'container',
-    ];
+    #[Validate(['string', 'required'])]
+    public string $name;
+
+    #[Validate(['string', 'required'])]
+    public string $command;
+
+    #[Validate(['string', 'required'])]
+    public string $frequency;
+
+    #[Validate(['string', 'nullable'])]
+    public ?string $container = null;
+
+    #[Validate(['integer', 'required', 'min:60', 'max:36000'])]
+    public $timeout = 300;
+
+    #[Locked]
+    public ?string $application_uuid;
+
+    #[Locked]
+    public ?string $service_uuid;
+
+    #[Locked]
+    public string $task_uuid;
 
     public function mount()
     {
-        $this->parameters = get_route_parameters();
+        try {
+            $task_uuid = request()->route('task_uuid');
+            $project_uuid = request()->route('project_uuid');
+            $environment_uuid = request()->route('environment_uuid');
+            $application_uuid = request()->route('application_uuid');
+            $service_uuid = request()->route('service_uuid');
 
-        if (data_get($this->parameters, 'application_uuid')) {
-            $this->type = 'application';
-            $this->resource = Application::where('uuid', $this->parameters['application_uuid'])->firstOrFail();
-        } elseif (data_get($this->parameters, 'service_uuid')) {
-            $this->type = 'service';
-            $this->resource = Service::where('uuid', $this->parameters['service_uuid'])->firstOrFail();
+            $this->task_uuid = $task_uuid;
+            if ($application_uuid) {
+                $this->type = 'application';
+                $this->application_uuid = $application_uuid;
+                $this->resource = Application::ownedByCurrentTeam()->where('uuid', $application_uuid)->firstOrFail();
+            } elseif ($service_uuid) {
+                $this->type = 'service';
+                $this->service_uuid = $service_uuid;
+                $this->resource = Service::ownedByCurrentTeamCached()->where('uuid', $service_uuid)->firstOrFail();
+            }
+            $this->parameters = [
+                'environment_uuid' => $environment_uuid,
+                'project_uuid' => $project_uuid,
+                'application_uuid' => $application_uuid,
+                'service_uuid' => $service_uuid,
+            ];
+
+            $this->task = $this->resource->scheduled_tasks()->where('uuid', $task_uuid)->firstOrFail();
+            $this->syncData();
+        } catch (\Exception $e) {
+            return handleError($e);
         }
+    }
 
-        $this->modalId = new Cuid2;
-        $this->task = ModelsScheduledTask::where('uuid', request()->route('task_uuid'))->first();
+    private function syncData(bool $toModel = false): void
+    {
+        if ($toModel) {
+            $this->validate();
+            $isValid = validate_cron_expression($this->frequency);
+            if (! $isValid) {
+                $this->frequency = $this->task->frequency;
+                throw new \Exception('Invalid Cron / Human expression.');
+            }
+            $this->task->enabled = $this->isEnabled;
+            $this->task->name = str($this->name)->trim()->value();
+            $this->task->command = str($this->command)->trim()->value();
+            $this->task->frequency = str($this->frequency)->trim()->value();
+            $this->task->container = str($this->container)->trim()->value();
+            $this->task->timeout = (int) $this->timeout;
+            $this->task->save();
+        } else {
+            $this->isEnabled = $this->task->enabled;
+            $this->name = $this->task->name;
+            $this->command = $this->task->command;
+            $this->frequency = $this->task->frequency;
+            $this->container = $this->task->container;
+            $this->timeout = $this->task->timeout ?? 300;
+        }
+    }
+
+    public function toggleEnabled()
+    {
+        try {
+            $this->authorize('update', $this->resource);
+            $this->authorize('update', $this->task);
+            $this->isEnabled = ! $this->isEnabled;
+            $this->task->enabled = $this->isEnabled;
+            $this->task->save();
+            $this->dispatch('success', $this->isEnabled ? 'Scheduled task enabled.' : 'Scheduled task disabled.');
+        } catch (\Exception $e) {
+            return handleError($e);
+        }
     }
 
     public function instantSave()
     {
-        $this->validateOnly('task.enabled');
-        $this->task->save(['enabled' => $this->task->enabled]);
-        $this->dispatch('success', 'Scheduled task updated.');
-        $this->dispatch('refreshTasks');
+        try {
+            $this->authorize('update', $this->resource);
+            $this->authorize('update', $this->task);
+            $this->syncData(true);
+            $this->dispatch('success', 'Scheduled task updated.');
+            $this->refreshTasks();
+        } catch (\Exception $e) {
+            return handleError($e);
+        }
     }
 
     public function submit()
     {
-        $this->validate();
-        $this->task->name = str($this->task->name)->trim()->value();
-        $this->task->container = str($this->task->container)->trim()->value();
-        $this->task->save();
-        $this->dispatch('success', 'Scheduled task updated.');
-        $this->dispatch('refreshTasks');
+        try {
+            $this->authorize('update', $this->resource);
+            $this->authorize('update', $this->task);
+            $this->syncData(true);
+            $this->dispatch('success', 'Scheduled task updated.');
+        } catch (\Exception $e) {
+            return handleError($e, $this);
+        }
+    }
+
+    public function refreshTasks()
+    {
+        try {
+            $this->task->refresh();
+        } catch (\Exception $e) {
+            return handleError($e);
+        }
     }
 
     public function delete()
     {
         try {
+            $this->authorize('update', $this->resource);
+            $this->authorize('delete', $this->task);
             $this->task->delete();
 
-            if ($this->type == 'application') {
-                return redirect()->route('project.application.configuration', $this->parameters);
+            if ($this->type === 'application') {
+                return redirectRoute($this, 'project.application.scheduled-tasks.show', $this->parameters);
             } else {
-                return redirect()->route('project.service.configuration', $this->parameters);
+                return redirectRoute($this, 'project.service.scheduled-tasks.show', $this->parameters);
             }
+        } catch (\Exception $e) {
+            return handleError($e);
+        }
+    }
+
+    public function executeNow()
+    {
+        try {
+            $this->authorize('update', $this->resource);
+            $this->authorize('update', $this->task);
+            ScheduledTaskJob::dispatch($this->task);
+            $this->dispatch('success', 'Scheduled task executed.');
         } catch (\Exception $e) {
             return handleError($e);
         }

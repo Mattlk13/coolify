@@ -3,51 +3,129 @@
 namespace App\Livewire\Security\PrivateKey;
 
 use App\Models\PrivateKey;
+use App\Support\ValidationPatterns;
+use Illuminate\Auth\Access\AuthorizationException;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
 
 class Show extends Component
 {
+    use AuthorizesRequests;
+
     public PrivateKey $private_key;
+
+    public bool $modalMode = false;
+
+    // Explicit properties
+    public string $name;
+
+    public ?string $description = null;
+
+    public string $privateKeyValue;
+
+    public bool $isGitRelated = false;
+
+    public bool $isInUse = false;
 
     public $public_key = 'Loading...';
 
-    protected $rules = [
-        'private_key.name' => 'required|string',
-        'private_key.description' => 'nullable|string',
-        'private_key.private_key' => 'required|string',
-        'private_key.is_git_related' => 'nullable|boolean',
-    ];
+    public string $deleteDisabledReason = 'This private key is currently used by a server, application, or Git app and cannot be deleted.';
+
+    protected function rules(): array
+    {
+        return [
+            'name' => ValidationPatterns::nameRules(),
+            'description' => ValidationPatterns::descriptionRules(),
+            'privateKeyValue' => 'required|string',
+            'isGitRelated' => 'nullable|boolean',
+        ];
+    }
+
+    protected function messages(): array
+    {
+        return array_merge(
+            ValidationPatterns::combinedMessages(),
+            [
+                'name.required' => 'The Name field is required.',
+                'privateKeyValue.required' => 'The Private Key field is required.',
+                'privateKeyValue.string' => 'The Private Key must be a valid string.',
+            ]
+        );
+    }
 
     protected $validationAttributes = [
-        'private_key.name' => 'name',
-        'private_key.description' => 'description',
-        'private_key.private_key' => 'private key',
+        'name' => 'name',
+        'description' => 'description',
+        'privateKeyValue' => 'private key',
     ];
 
-    public function mount()
+    /**
+     * Sync data between component properties and model
+     *
+     * @param  bool  $toModel  If true, sync FROM properties TO model. If false, sync FROM model TO properties.
+     */
+    private function syncData(bool $toModel = false): void
     {
-        try {
-            $this->private_key = PrivateKey::ownedByCurrentTeam(['name', 'description', 'private_key', 'is_git_related'])->whereUuid(request()->private_key_uuid)->firstOrFail();
-        } catch (\Throwable $e) {
-            return handleError($e, $this);
+        if ($toModel) {
+            // Sync TO model (before save)
+            $this->private_key->name = $this->name;
+            $this->private_key->description = $this->description;
+            $this->private_key->private_key = $this->privateKeyValue;
+            $this->private_key->is_git_related = $this->isGitRelated;
+        } else {
+            // Sync FROM model (on load/refresh)
+            $this->name = $this->private_key->name;
+            $this->description = $this->private_key->description;
+            $this->privateKeyValue = auth()->user()->can('update', $this->private_key)
+                ? $this->private_key->private_key
+                : '';
+            $this->isGitRelated = $this->private_key->is_git_related;
         }
     }
 
-    public function loadPublicKey()
+    public function mount(?string $private_key_uuid = null, bool $modalMode = false)
     {
-        $this->public_key = $this->private_key->publicKey();
+        $this->modalMode = $modalMode;
+        try {
+            $this->private_key = PrivateKey::ownedByCurrentTeam(['name', 'description', 'private_key', 'is_git_related', 'team_id'])->whereUuid($private_key_uuid ?? request()->private_key_uuid)->firstOrFail();
+
+            // Explicit authorization check - will throw 403 if not authorized
+            $this->authorize('view', $this->private_key);
+
+            $this->syncData(false);
+            $this->isInUse = $this->private_key->isInUse();
+            $this->public_key = $this->private_key->getPublicKey();
+        } catch (AuthorizationException $e) {
+            abort(403, 'You do not have permission to view this private key.');
+        } catch (\Throwable) {
+            abort(404);
+        }
     }
 
     public function delete()
     {
         try {
-            if ($this->private_key->isEmpty()) {
-                $this->private_key->delete();
-                currentTeam()->privateKeys = PrivateKey::where('team_id', currentTeam()->id)->get();
+            $this->authorize('delete', $this->private_key);
 
-                return redirect()->route('security.private-key.index');
+            if ($this->private_key->isInUse()) {
+                $this->isInUse = true;
+                $this->dispatch('error', $this->deleteDisabledReason);
+
+                return;
             }
-            $this->dispatch('error', 'This private key is in use and cannot be deleted. Please delete all servers, applications, and GitHub/GitLab apps that use this private key before deleting it.');
+
+            $this->private_key->delete();
+            currentTeam()->privateKeys = PrivateKey::where('team_id', currentTeam()->id)->get();
+
+            if ($this->modalMode) {
+                $this->dispatch('privateKeyDeleted');
+
+                return null;
+            }
+
+            return redirectRoute($this, 'security.private-key.index');
+        } catch (\Exception $e) {
+            $this->dispatch('error', $e->getMessage());
         } catch (\Throwable $e) {
             return handleError($e, $this);
         }
@@ -56,10 +134,22 @@ class Show extends Component
     public function changePrivateKey()
     {
         try {
-            $this->private_key->private_key = formatPrivateKey($this->private_key->private_key);
-            $this->private_key->save();
+            $this->authorize('update', $this->private_key);
+
+            $this->validate();
+
+            $this->syncData(true);
+            $this->private_key->updatePrivateKey([
+                'private_key' => formatPrivateKey($this->private_key->private_key),
+            ]);
             refresh_server_connection($this->private_key);
             $this->dispatch('success', 'Private key updated.');
+            if ($this->modalMode) {
+                $this->dispatch('privateKeyUpdated');
+
+                return null;
+            }
+            $this->dispatch('securityResourceChanged');
         } catch (\Throwable $e) {
             return handleError($e, $this);
         }

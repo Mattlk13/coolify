@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\PrivateKey;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use OpenApi\Attributes as OA;
 
@@ -11,13 +12,15 @@ class SecurityController extends Controller
 {
     private function removeSensitiveData($team)
     {
-        $token = auth()->user()->currentAccessToken();
-        if ($token->can('view:sensitive')) {
-            return serializeApiResponse($team);
+        if (request()->attributes->get('can_read_sensitive', false) === false) {
+            $team->makeHidden([
+                'private_key',
+            ]);
+        } else {
+            $team->makeVisible([
+                'private_key',
+            ]);
         }
-        $team->makeHidden([
-            'private_key',
-        ]);
 
         return serializeApiResponse($team);
     }
@@ -26,6 +29,7 @@ class SecurityController extends Controller
         summary: 'List',
         description: 'List all private keys.',
         path: '/security/keys',
+        operationId: 'list-private-keys',
         security: [
             ['bearerAuth' => []],
         ],
@@ -68,26 +72,20 @@ class SecurityController extends Controller
         summary: 'Get',
         description: 'Get key by UUID.',
         path: '/security/keys/{uuid}',
+        operationId: 'get-private-key-by-uuid',
         security: [
             ['bearerAuth' => []],
         ],
         tags: ['Private Keys'],
         parameters: [
-            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Private Key Uuid', schema: new OA\Schema(type: 'string')),
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Private Key UUID', schema: new OA\Schema(type: 'string')),
         ],
         responses: [
             new OA\Response(
                 response: 200,
                 description: 'Get all private keys.',
-                content: [
-                    new OA\MediaType(
-                        mediaType: 'application/json',
-                        schema: new OA\Schema(
-                            type: 'array',
-                            items: new OA\Items(ref: '#/components/schemas/PrivateKey')
-                        )
-                    ),
-                ]),
+                content: new OA\JsonContent(ref: '#/components/schemas/PrivateKey')
+            ),
             new OA\Response(
                 response: 401,
                 ref: '#/components/responses/401',
@@ -116,6 +114,7 @@ class SecurityController extends Controller
                 'message' => 'Private Key not found.',
             ], 404);
         }
+        $this->authorize('view', $key);
 
         return response()->json($this->removeSensitiveData($key));
     }
@@ -124,6 +123,7 @@ class SecurityController extends Controller
         summary: 'Create',
         description: 'Create a new private key.',
         path: '/security/keys',
+        operationId: 'create-private-key',
         security: [
             ['bearerAuth' => []],
         ],
@@ -169,6 +169,10 @@ class SecurityController extends Controller
                 response: 400,
                 ref: '#/components/responses/400',
             ),
+            new OA\Response(
+                response: 422,
+                ref: '#/components/responses/422',
+            ),
         ]
     )]
     public function create_key(Request $request)
@@ -177,8 +181,9 @@ class SecurityController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
+        $this->authorize('create', [PrivateKey::class]);
         $return = validateIncomingRequest($request);
-        if ($return instanceof \Illuminate\Http\JsonResponse) {
+        if ($return instanceof JsonResponse) {
             return $return;
         }
         $validator = customApiValidator($request->all(), [
@@ -201,11 +206,43 @@ class SecurityController extends Controller
         if (! $request->description) {
             $request->offsetSet('description', 'Created by Coolify via API');
         }
+
+        $isPrivateKeyString = str_starts_with($request->private_key, '-----BEGIN');
+        if (! $isPrivateKeyString) {
+            try {
+                $base64PrivateKey = base64_decode($request->private_key);
+                $request->offsetSet('private_key', $base64PrivateKey);
+            } catch (\Exception $e) {
+                return response()->json([
+                    'message' => 'Invalid private key.',
+                ], 422);
+            }
+        }
+        $isPrivateKeyValid = PrivateKey::validatePrivateKey($request->private_key);
+        if (! $isPrivateKeyValid) {
+            return response()->json([
+                'message' => 'Invalid private key.',
+            ], 422);
+        }
+        $fingerPrint = PrivateKey::generateFingerprint($request->private_key);
+        $isFingerPrintExists = PrivateKey::fingerprintExists($fingerPrint);
+        if ($isFingerPrintExists) {
+            return response()->json([
+                'message' => 'Private key already exists.',
+            ], 422);
+        }
         $key = PrivateKey::create([
             'team_id' => $teamId,
             'name' => $request->name,
             'description' => $request->description,
             'private_key' => $request->private_key,
+        ]);
+
+        auditLog('api.private_key.created', [
+            'team_id' => $teamId,
+            'private_key_uuid' => $key->uuid,
+            'private_key_name' => $key->name,
+            'fingerprint' => $fingerPrint,
         ]);
 
         return response()->json(serializeApiResponse([
@@ -217,6 +254,7 @@ class SecurityController extends Controller
         summary: 'Update',
         description: 'Update a private key.',
         path: '/security/keys',
+        operationId: 'update-private-key',
         security: [
             ['bearerAuth' => []],
         ],
@@ -262,6 +300,10 @@ class SecurityController extends Controller
                 response: 400,
                 ref: '#/components/responses/400',
             ),
+            new OA\Response(
+                response: 422,
+                ref: '#/components/responses/422',
+            ),
         ]
     )]
     public function update_key(Request $request)
@@ -272,7 +314,7 @@ class SecurityController extends Controller
             return invalidTokenResponse();
         }
         $return = validateIncomingRequest($request);
-        if ($return instanceof \Illuminate\Http\JsonResponse) {
+        if ($return instanceof JsonResponse) {
             return $return;
         }
 
@@ -302,7 +344,15 @@ class SecurityController extends Controller
                 'message' => 'Private Key not found.',
             ], 404);
         }
-        $foundKey->update($request->all());
+        $this->authorize('update', $foundKey);
+        $foundKey->update($request->only($allowedFields));
+
+        auditLog('api.private_key.updated', [
+            'team_id' => $teamId,
+            'private_key_uuid' => $foundKey->uuid,
+            'private_key_name' => $foundKey->name,
+            'changed_fields' => array_values(array_intersect($allowedFields, array_keys($request->all()))),
+        ]);
 
         return response()->json(serializeApiResponse([
             'uuid' => $foundKey->uuid,
@@ -313,12 +363,13 @@ class SecurityController extends Controller
         summary: 'Delete',
         description: 'Delete a private key.',
         path: '/security/keys/{uuid}',
+        operationId: 'delete-private-key-by-uuid',
         security: [
             ['bearerAuth' => []],
         ],
         tags: ['Private Keys'],
         parameters: [
-            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Private Key Uuid', schema: new OA\Schema(type: 'string')),
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Private Key UUID', schema: new OA\Schema(type: 'string')),
         ],
         responses: [
             new OA\Response(
@@ -347,6 +398,20 @@ class SecurityController extends Controller
                 response: 404,
                 description: 'Private Key not found.',
             ),
+            new OA\Response(
+                response: 422,
+                description: 'Private Key is in use and cannot be deleted.',
+                content: [
+                    new OA\MediaType(
+                        mediaType: 'application/json',
+                        schema: new OA\Schema(
+                            type: 'object',
+                            properties: [
+                                'message' => ['type' => 'string', 'example' => 'Private Key is in use and cannot be deleted.'],
+                            ]
+                        )
+                    ),
+                ]),
         ]
     )]
     public function delete_key(Request $request)
@@ -363,7 +428,24 @@ class SecurityController extends Controller
         if (is_null($key)) {
             return response()->json(['message' => 'Private Key not found.'], 404);
         }
+        $this->authorize('delete', $key);
+
+        if ($key->isInUse()) {
+            return response()->json([
+                'message' => 'Private Key is in use and cannot be deleted.',
+                'details' => 'This private key is currently being used by servers, applications, or Git integrations.',
+            ], 422);
+        }
+
+        $keyUuid = $key->uuid;
+        $keyName = $key->name;
         $key->forceDelete();
+
+        auditLog('api.private_key.deleted', [
+            'team_id' => $teamId,
+            'private_key_uuid' => $keyUuid,
+            'private_key_name' => $keyName,
+        ]);
 
         return response()->json([
             'message' => 'Private Key deleted.',

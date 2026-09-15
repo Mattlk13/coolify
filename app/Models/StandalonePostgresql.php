@@ -2,35 +2,113 @@
 
 namespace App\Models;
 
+use App\Traits\ClearsGlobalSearchCache;
+use App\Traits\HasDatabaseHealthCheck;
+use App\Traits\HasMetrics;
+use App\Traits\HasSafeStringAttribute;
 use Illuminate\Database\Eloquent\Casts\Attribute;
-use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
-use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
 class StandalonePostgresql extends BaseModel
 {
-    use HasFactory, SoftDeletes;
+    use ClearsGlobalSearchCache, HasDatabaseHealthCheck, HasFactory, HasMetrics, HasSafeStringAttribute, SoftDeletes;
 
-    protected $guarded = [];
+    protected $fillable = [
+        'uuid',
+        'name',
+        'description',
+        'postgres_user',
+        'postgres_password',
+        'postgres_db',
+        'postgres_initdb_args',
+        'postgres_host_auth_method',
+        'postgres_conf',
+        'init_scripts',
+        'status',
+        'image',
+        'is_public',
+        'public_port',
+        'ports_mappings',
+        'limits_memory',
+        'limits_memory_swap',
+        'limits_memory_swappiness',
+        'limits_memory_reservation',
+        'limits_cpus',
+        'limits_cpuset',
+        'limits_cpu_shares',
+        'started_at',
+        'restart_count',
+        'last_restart_at',
+        'last_restart_type',
+        'last_online_at',
+        'public_port_timeout',
+        'enable_ssl',
+        'ssl_mode',
+        'is_log_drain_enabled',
+        'is_include_timestamps',
+        'custom_docker_run_options',
+        'destination_type',
+        'destination_id',
+        'environment_id',
+        'health_check_enabled',
+        'health_check_interval',
+        'health_check_timeout',
+        'health_check_retries',
+        'health_check_start_period',
+    ];
 
     protected $appends = ['internal_db_url', 'external_db_url', 'database_type', 'server_status'];
 
+    /**
+     * Sensitive fields hidden by default in serialized output (toArray/toJson).
+     * API controllers should call makeVisible([...]) for callers with the
+     * `read:sensitive` or `root` token ability.
+     */
+    protected $hidden = [
+        'postgres_password',
+        'init_scripts',
+        'internal_db_url',
+        'external_db_url',
+    ];
+
     protected $casts = [
+        'health_check_enabled' => 'boolean',
+        'health_check_interval' => 'integer',
+        'health_check_timeout' => 'integer',
+        'health_check_retries' => 'integer',
+        'health_check_start_period' => 'integer',
         'init_scripts' => 'array',
         'postgres_password' => 'encrypted',
+        'public_port_timeout' => 'integer',
+        'restart_count' => 'integer',
+        'last_restart_at' => 'datetime',
+        'last_restart_type' => 'string',
     ];
 
     protected static function booted()
     {
         static::created(function ($database) {
+            // This is really stupid and it took me 1h to figure out why the image was not loading properly. This is exactly the reason why we need to use the action pattern because Model events and Accessors are a fragile mess!
+            $image = (string) ($database->getAttributes()['image'] ?? '');
+            $majorVersion = 0;
+
+            if (preg_match('/:(?:pg)?(\d+)/i', $image, $matches)) {
+                $majorVersion = (int) $matches[1];
+            }
+
+            // PostgreSQL 18+ uses /var/lib/postgresql as mount path
+            // Older versions use /var/lib/postgresql/data
+            $mountPath = $majorVersion >= 18
+                ? '/var/lib/postgresql'
+                : '/var/lib/postgresql/data';
+
             LocalPersistentVolume::create([
                 'name' => 'postgres-data-'.$database->uuid,
-                'mount_path' => '/var/lib/postgresql/data',
+                'mount_path' => $mountPath,
                 'host_path' => null,
                 'resource_id' => $database->id,
                 'resource_type' => $database->getMorphClass(),
-                'is_readonly' => true,
             ]);
         });
         static::forceDeleting(function ($database) {
@@ -38,6 +116,30 @@ class StandalonePostgresql extends BaseModel
             $database->scheduledBackups()->delete();
             $database->environment_variables()->delete();
             $database->tags()->detach();
+        });
+        static::saving(function ($database) {
+            if ($database->isDirty('status')) {
+                $database->last_online_at = now();
+            }
+        });
+    }
+
+    /**
+     * Get query builder for PostgreSQL databases owned by current team.
+     * If you need all databases without further query chaining, use ownedByCurrentTeamCached() instead.
+     */
+    public static function ownedByCurrentTeam()
+    {
+        return StandalonePostgresql::whereRelation('environment.project.team', 'id', currentTeam()->id)->orderBy('name');
+    }
+
+    /**
+     * Get all PostgreSQL databases owned by current team (cached for request duration).
+     */
+    public static function ownedByCurrentTeamCached()
+    {
+        return once(function () {
+            return StandalonePostgresql::ownedByCurrentTeam()->get();
         });
     }
 
@@ -55,7 +157,7 @@ class StandalonePostgresql extends BaseModel
         );
     }
 
-    public function delete_configurations()
+    public function deleteConfigurations()
     {
         $server = data_get($this, 'destination.server');
         $workdir = $this->workdir();
@@ -64,22 +166,23 @@ class StandalonePostgresql extends BaseModel
         }
     }
 
-    public function delete_volumes(Collection $persistentStorages)
+    public function deleteVolumes()
     {
+        $persistentStorages = $this->persistentStorages()->get() ?? collect();
         if ($persistentStorages->count() === 0) {
             return;
         }
         $server = data_get($this, 'destination.server');
         foreach ($persistentStorages as $storage) {
-            ray('Deleting volume: '.$storage->name);
-            instant_remote_process(["docker volume rm -f $storage->name"], $server, false);
+            instant_remote_process(['docker volume rm -f '.escapeshellarg($storage->name)], $server, false);
         }
     }
 
     public function isConfigurationChanged(bool $save = false)
     {
         $newConfigHash = $this->image.$this->ports_mappings.$this->postgres_initdb_args.$this->postgres_host_auth_method;
-        $newConfigHash .= json_encode($this->environment_variables()->get('value')->sort());
+        $newConfigHash .= $this->healthCheckConfigurationHash();
+        $newConfigHash .= json_encode($this->environment_variables()->get('value')->makeVisible('value')->sort());
         $newConfigHash = md5($newConfigHash);
         $oldConfigHash = data_get($this, 'config_hash');
         if ($oldConfigHash === null) {
@@ -100,6 +203,11 @@ class StandalonePostgresql extends BaseModel
 
             return true;
         }
+    }
+
+    public function isRunning()
+    {
+        return (bool) str($this->status)->contains('running');
     }
 
     public function isExited()
@@ -161,7 +269,7 @@ class StandalonePostgresql extends BaseModel
         if (data_get($this, 'environment.project.uuid')) {
             return route('project.database.configuration', [
                 'project_uuid' => data_get($this, 'environment.project.uuid'),
-                'environment_name' => data_get($this, 'environment.name'),
+                'environment_uuid' => data_get($this, 'environment.uuid'),
                 'database_uuid' => data_get($this, 'uuid'),
             ]);
         }
@@ -211,7 +319,19 @@ class StandalonePostgresql extends BaseModel
     protected function internalDbUrl(): Attribute
     {
         return new Attribute(
-            get: fn () => "postgres://{$this->postgres_user}:{$this->postgres_password}@{$this->uuid}:5432/{$this->postgres_db}",
+            get: function () {
+                $encodedUser = rawurlencode($this->postgres_user);
+                $encodedPass = rawurlencode($this->postgres_password);
+                $url = "postgres://{$encodedUser}:{$encodedPass}@{$this->uuid}:5432/{$this->postgres_db}";
+                if ($this->enable_ssl) {
+                    $url .= "?sslmode={$this->ssl_mode}";
+                    if (in_array($this->ssl_mode, ['verify-ca', 'verify-full'])) {
+                        $url .= '&sslrootcert=/etc/ssl/certs/coolify-ca.crt';
+                    }
+                }
+
+                return $url;
+            },
         );
     }
 
@@ -220,7 +340,21 @@ class StandalonePostgresql extends BaseModel
         return new Attribute(
             get: function () {
                 if ($this->is_public && $this->public_port) {
-                    return "postgres://{$this->postgres_user}:{$this->postgres_password}@{$this->destination->server->getIp}:{$this->public_port}/{$this->postgres_db}";
+                    $serverIp = $this->destination->server->getIp;
+                    if (empty($serverIp)) {
+                        return null;
+                    }
+                    $encodedUser = rawurlencode($this->postgres_user);
+                    $encodedPass = rawurlencode($this->postgres_password);
+                    $url = "postgres://{$encodedUser}:{$encodedPass}@{$serverIp}:{$this->public_port}/{$this->postgres_db}";
+                    if ($this->enable_ssl) {
+                        $url .= "?sslmode={$this->ssl_mode}";
+                        if (in_array($this->ssl_mode, ['verify-ca', 'verify-full'])) {
+                            $url .= '&sslrootcert=/etc/ssl/certs/coolify-ca.crt';
+                        }
+                    }
+
+                    return $url;
                 }
 
                 return null;
@@ -233,9 +367,19 @@ class StandalonePostgresql extends BaseModel
         return $this->belongsTo(Environment::class);
     }
 
+    public function persistentStorages()
+    {
+        return $this->morphMany(LocalPersistentVolume::class, 'resource');
+    }
+
     public function fileStorages()
     {
         return $this->morphMany(LocalFileVolume::class, 'resource');
+    }
+
+    public function sslCertificates()
+    {
+        return $this->morphMany(SslCertificate::class, 'resource');
     }
 
     public function destination()
@@ -243,19 +387,9 @@ class StandalonePostgresql extends BaseModel
         return $this->morphTo();
     }
 
-    public function environment_variables(): HasMany
+    public function runtime_environment_variables()
     {
-        return $this->hasMany(EnvironmentVariable::class);
-    }
-
-    public function runtime_environment_variables(): HasMany
-    {
-        return $this->hasMany(EnvironmentVariable::class);
-    }
-
-    public function persistentStorages()
-    {
-        return $this->morphMany(LocalPersistentVolume::class, 'resource');
+        return $this->morphMany(EnvironmentVariable::class, 'resourceable');
     }
 
     public function scheduledBackups()
@@ -263,32 +397,13 @@ class StandalonePostgresql extends BaseModel
         return $this->morphMany(ScheduledDatabaseBackup::class, 'database');
     }
 
-    public function getMetrics(int $mins = 5)
+    public function environment_variables()
     {
-        $server = $this->destination->server;
-        $container_name = $this->uuid;
-        if ($server->isMetricsEnabled()) {
-            $from = now()->subMinutes($mins)->toIso8601ZuluString();
-            $metrics = instant_remote_process(["docker exec coolify-sentinel sh -c 'curl -H \"Authorization: Bearer {$server->settings->metrics_token}\" http://localhost:8888/api/container/{$container_name}/metrics/history?from=$from'"], $server, false);
-            if (str($metrics)->contains('error')) {
-                $error = json_decode($metrics, true);
-                $error = data_get($error, 'error', 'Something is not okay, are you okay?');
-                if ($error == 'Unauthorized') {
-                    $error = 'Unauthorized, please check your metrics token or restart Sentinel to set a new token.';
-                }
-                throw new \Exception($error);
-            }
-            $metrics = str($metrics)->explode("\n")->skip(1)->all();
-            $parsedCollection = collect($metrics)->flatMap(function ($item) {
-                return collect(explode("\n", trim($item)))->map(function ($line) {
-                    [$time, $cpu_usage_percent, $memory_usage, $memory_usage_percent] = explode(',', trim($line));
-                    $cpu_usage_percent = number_format($cpu_usage_percent, 2);
+        return $this->morphMany(EnvironmentVariable::class, 'resourceable');
+    }
 
-                    return [(int) $time, (float) $cpu_usage_percent, (int) $memory_usage];
-                });
-            });
-
-            return $parsedCollection->toArray();
-        }
+    public function isBackupSolutionAvailable()
+    {
+        return true;
     }
 }

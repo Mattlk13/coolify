@@ -2,62 +2,214 @@
 
 namespace App\Livewire\Notifications;
 
+use App\Livewire\Notifications\Concerns\TogglesNotificationEvents;
+use App\Models\DiscordNotificationSettings;
 use App\Models\Team;
 use App\Notifications\Test;
+use App\Rules\SafeWebhookUrl;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Livewire\Attributes\Validate;
 use Livewire\Component;
 
 class Discord extends Component
 {
+    use AuthorizesRequests, TogglesNotificationEvents;
+
     public Team $team;
 
-    protected $rules = [
-        'team.discord_enabled' => 'nullable|boolean',
-        'team.discord_webhook_url' => 'required|url',
-        'team.discord_notifications_test' => 'nullable|boolean',
-        'team.discord_notifications_deployments' => 'nullable|boolean',
-        'team.discord_notifications_status_changes' => 'nullable|boolean',
-        'team.discord_notifications_database_backups' => 'nullable|boolean',
-        'team.discord_notifications_scheduled_tasks' => 'nullable|boolean',
-    ];
+    public DiscordNotificationSettings $settings;
 
-    protected $validationAttributes = [
-        'team.discord_webhook_url' => 'Discord Webhook',
-    ];
+    #[Validate(['boolean'])]
+    public bool $discordEnabled = false;
+
+    #[Validate(['nullable', new SafeWebhookUrl])]
+    public ?string $discordWebhookUrl = null;
+
+    #[Validate(['boolean'])]
+    public bool $deploymentSuccessDiscordNotifications = false;
+
+    #[Validate(['boolean'])]
+    public bool $deploymentFailureDiscordNotifications = true;
+
+    #[Validate(['boolean'])]
+    public bool $statusChangeDiscordNotifications = false;
+
+    #[Validate(['boolean'])]
+    public bool $restartLimitReachedDiscordNotifications = true;
+
+    #[Validate(['boolean'])]
+    public bool $backupSuccessDiscordNotifications = false;
+
+    #[Validate(['boolean'])]
+    public bool $backupFailureDiscordNotifications = true;
+
+    #[Validate(['boolean'])]
+    public bool $scheduledTaskSuccessDiscordNotifications = false;
+
+    #[Validate(['boolean'])]
+    public bool $scheduledTaskFailureDiscordNotifications = true;
+
+    #[Validate(['boolean'])]
+    public bool $dockerCleanupSuccessDiscordNotifications = false;
+
+    #[Validate(['boolean'])]
+    public bool $dockerCleanupFailureDiscordNotifications = true;
+
+    #[Validate(['boolean'])]
+    public bool $serverDiskUsageDiscordNotifications = true;
+
+    #[Validate(['boolean'])]
+    public bool $serverReachableDiscordNotifications = false;
+
+    #[Validate(['boolean'])]
+    public bool $serverUnreachableDiscordNotifications = true;
+
+    #[Validate(['boolean'])]
+    public bool $serverPatchDiscordNotifications = false;
+
+    #[Validate(['boolean'])]
+    public bool $traefikOutdatedDiscordNotifications = true;
+
+    #[Validate(['boolean'])]
+    public bool $discordPingEnabled = true;
 
     public function mount()
     {
-        $this->team = auth()->user()->currentTeam();
+        try {
+            $this->team = auth()->user()->currentTeam();
+            $this->settings = $this->team->discordNotificationSettings;
+            $this->authorize('view', $this->settings);
+            $this->syncData();
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
+    }
+
+    private function syncData(bool $toModel = false): void
+    {
+        if ($toModel) {
+            $this->validate();
+            $this->settings->discord_enabled = $this->discordEnabled;
+            $this->settings->discord_webhook_url = $this->discordWebhookUrl;
+
+            $this->settings->deployment_success_discord_notifications = $this->deploymentSuccessDiscordNotifications;
+            $this->settings->deployment_failure_discord_notifications = $this->deploymentFailureDiscordNotifications;
+            $this->settings->status_change_discord_notifications = $this->statusChangeDiscordNotifications;
+            $this->settings->restart_limit_reached_discord_notifications = $this->restartLimitReachedDiscordNotifications;
+            $this->settings->backup_success_discord_notifications = $this->backupSuccessDiscordNotifications;
+            $this->settings->backup_failure_discord_notifications = $this->backupFailureDiscordNotifications;
+            $this->settings->scheduled_task_success_discord_notifications = $this->scheduledTaskSuccessDiscordNotifications;
+            $this->settings->scheduled_task_failure_discord_notifications = $this->scheduledTaskFailureDiscordNotifications;
+            $this->settings->docker_cleanup_success_discord_notifications = $this->dockerCleanupSuccessDiscordNotifications;
+            $this->settings->docker_cleanup_failure_discord_notifications = $this->dockerCleanupFailureDiscordNotifications;
+            $this->settings->server_disk_usage_discord_notifications = $this->serverDiskUsageDiscordNotifications;
+            $this->settings->server_reachable_discord_notifications = $this->serverReachableDiscordNotifications;
+            $this->settings->server_unreachable_discord_notifications = $this->serverUnreachableDiscordNotifications;
+            $this->settings->server_patch_discord_notifications = $this->serverPatchDiscordNotifications;
+            $this->settings->traefik_outdated_discord_notifications = $this->traefikOutdatedDiscordNotifications;
+
+            $this->settings->discord_ping_enabled = $this->discordPingEnabled;
+
+            $this->settings->save();
+            refreshSession();
+        } else {
+            $this->discordEnabled = $this->settings->discord_enabled;
+            $this->discordWebhookUrl = auth()->user()->can('update', $this->settings)
+                ? $this->settings->discord_webhook_url
+                : null;
+
+            $this->deploymentSuccessDiscordNotifications = $this->settings->deployment_success_discord_notifications;
+            $this->deploymentFailureDiscordNotifications = $this->settings->deployment_failure_discord_notifications;
+            $this->statusChangeDiscordNotifications = $this->settings->status_change_discord_notifications;
+            $this->restartLimitReachedDiscordNotifications = $this->settings->restart_limit_reached_discord_notifications;
+            $this->backupSuccessDiscordNotifications = $this->settings->backup_success_discord_notifications;
+            $this->backupFailureDiscordNotifications = $this->settings->backup_failure_discord_notifications;
+            $this->scheduledTaskSuccessDiscordNotifications = $this->settings->scheduled_task_success_discord_notifications;
+            $this->scheduledTaskFailureDiscordNotifications = $this->settings->scheduled_task_failure_discord_notifications;
+            $this->dockerCleanupSuccessDiscordNotifications = $this->settings->docker_cleanup_success_discord_notifications;
+            $this->dockerCleanupFailureDiscordNotifications = $this->settings->docker_cleanup_failure_discord_notifications;
+            $this->serverDiskUsageDiscordNotifications = $this->settings->server_disk_usage_discord_notifications;
+            $this->serverReachableDiscordNotifications = $this->settings->server_reachable_discord_notifications;
+            $this->serverUnreachableDiscordNotifications = $this->settings->server_unreachable_discord_notifications;
+            $this->serverPatchDiscordNotifications = $this->settings->server_patch_discord_notifications;
+            $this->traefikOutdatedDiscordNotifications = $this->settings->traefik_outdated_discord_notifications;
+
+            $this->discordPingEnabled = $this->settings->discord_ping_enabled;
+        }
+    }
+
+    public function instantSaveDiscordPingEnabled()
+    {
+        try {
+            $original = $this->discordPingEnabled;
+            $this->validate([
+                'discordPingEnabled' => 'required',
+            ]);
+            $this->saveModel();
+        } catch (\Throwable $e) {
+            $this->discordPingEnabled = $original;
+
+            return handleError($e, $this);
+        }
+    }
+
+    public function instantSaveDiscordEnabled()
+    {
+        try {
+            $original = $this->discordEnabled;
+            $this->validate([
+                'discordWebhookUrl' => 'required',
+            ], [
+                'discordWebhookUrl.required' => 'Discord Webhook URL is required.',
+            ]);
+            $this->saveModel();
+        } catch (\Throwable $e) {
+            $this->discordEnabled = $original;
+
+            return handleError($e, $this);
+        }
     }
 
     public function instantSave()
     {
         try {
-            $this->submit();
+            $this->authorize('update', $this->settings);
+            $this->syncData(true);
         } catch (\Throwable $e) {
-            ray($e->getMessage());
-            $this->team->discord_enabled = false;
-            $this->validate();
+            return handleError($e, $this);
         }
     }
 
     public function submit()
     {
-        $this->resetErrorBag();
-        $this->validate();
-        $this->saveModel();
+        try {
+            $this->resetErrorBag();
+            $this->authorize('update', $this->settings);
+            $this->syncData(true);
+            $this->saveModel();
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
     }
 
     public function saveModel()
     {
-        $this->team->save();
+        $this->authorize('update', $this->settings);
+
+        $this->syncData(true);
         refreshSession();
         $this->dispatch('success', 'Settings saved.');
     }
 
     public function sendTestNotification()
     {
-        $this->team?->notify(new Test);
-        $this->dispatch('success', 'Test notification sent.');
+        try {
+            $this->authorize('sendTest', $this->settings);
+            $this->team->notify(new Test(channel: 'discord'));
+            $this->dispatch('success', 'Test notification sent.');
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
     }
 
     public function render()

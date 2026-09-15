@@ -13,6 +13,7 @@ class ResourcesController extends Controller
         summary: 'List',
         description: 'Get all resources.',
         path: '/resources',
+        operationId: 'list-resources',
         security: [
             ['bearerAuth' => []],
         ],
@@ -42,6 +43,10 @@ class ResourcesController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
+
+        // General authorization check for viewing resources - using Project as base resource type
+        $this->authorize('viewAny', Project::class);
+
         $projects = Project::where('team_id', $teamId)->get();
         $resources = collect();
         $resources->push($projects->pluck('applications')->flatten());
@@ -51,12 +56,9 @@ class ResourcesController extends Controller
         }
         $resources = $resources->flatten();
         $resources = $resources->map(function ($resource) {
+            exposeSensitiveFields($resource);
             $payload = $resource->toArray();
-            if ($resource->getMorphClass() === 'App\Models\Service') {
-                $payload['status'] = $resource->status();
-            } else {
-                $payload['status'] = $resource->status;
-            }
+            $payload['status'] = $resource->status;
             $payload['type'] = $resource->type();
 
             return $payload;

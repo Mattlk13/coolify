@@ -2,150 +2,177 @@
 
 namespace App\Livewire\Settings;
 
-use App\Jobs\CheckForUpdatesJob;
 use App\Models\InstanceSettings;
 use App\Models\Server;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Livewire\Attributes\Computed;
+use Livewire\Attributes\Validate;
 use Livewire\Component;
 
 class Index extends Component
 {
+    use AuthorizesRequests;
+
     public InstanceSettings $settings;
 
-    public bool $do_not_track;
+    public ?Server $server = null;
 
-    public bool $is_auto_update_enabled;
+    #[Validate('nullable|string|max:255|url')]
+    public ?string $fqdn = null;
 
-    public bool $is_registration_enabled;
+    #[Validate('boolean')]
+    public bool $is_dashboard_force_https_enabled = true;
 
-    public bool $is_dns_validation_enabled;
+    #[Validate('required|integer|min:1025|max:65535')]
+    public int $public_port_min;
 
-    public bool $is_api_enabled;
+    #[Validate('required|integer|min:1025|max:65535')]
+    public int $public_port_max;
 
-    public string $auto_update_frequency;
+    #[Validate('nullable|string|max:255')]
+    public ?string $instance_name = null;
 
-    public string $update_check_frequency;
+    #[Validate('nullable|ipv4')]
+    public ?string $public_ipv4 = null;
 
-    protected string $dynamic_config_path = '/data/coolify/proxy/dynamic';
+    #[Validate('nullable|ipv6')]
+    public ?string $public_ipv6 = null;
 
-    protected Server $server;
+    #[Validate('required|string|timezone')]
+    public string $instance_timezone;
 
-    protected $rules = [
-        'settings.fqdn' => 'nullable',
-        'settings.resale_license' => 'nullable',
-        'settings.public_port_min' => 'required',
-        'settings.public_port_max' => 'required',
-        'settings.custom_dns_servers' => 'nullable',
-        'settings.instance_name' => 'nullable',
-        'settings.allowed_ips' => 'nullable',
-        'settings.is_auto_update_enabled' => 'boolean',
-        'auto_update_frequency' => 'string',
-        'update_check_frequency' => 'string',
+    #[Validate(['nullable', 'string', 'max:128', 'regex:/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/'])]
+    public ?string $dev_helper_version = null;
+
+    public array $domainConflicts = [];
+
+    public bool $showDomainConflictModal = false;
+
+    public bool $forceSaveDomains = false;
+
+    protected array $messages = [
+        'fqdn.url' => 'Invalid instance URL.',
+        'fqdn.max' => 'URL must not exceed 255 characters.',
+        'dev_helper_version.regex' => 'Dev helper version must match Docker tag format (alphanumeric, _, ., -; first char cannot be . or -).',
     ];
 
-    protected $validationAttributes = [
-        'settings.fqdn' => 'FQDN',
-        'settings.resale_license' => 'Resale License',
-        'settings.public_port_min' => 'Public port min',
-        'settings.public_port_max' => 'Public port max',
-        'settings.custom_dns_servers' => 'Custom DNS servers',
-        'settings.allowed_ips' => 'Allowed IPs',
-        'settings.is_auto_update_enabled' => 'Auto Update Enabled',
-        'auto_update_frequency' => 'Auto Update Frequency',
-        'update_check_frequency' => 'Update Check Frequency',
-    ];
+    public function render()
+    {
+        return view('livewire.settings.index');
+    }
 
     public function mount()
     {
-        if (isInstanceAdmin()) {
-            $this->settings = InstanceSettings::get();
-            $this->do_not_track = $this->settings->do_not_track;
-            $this->is_auto_update_enabled = $this->settings->is_auto_update_enabled;
-            $this->is_registration_enabled = $this->settings->is_registration_enabled;
-            $this->is_dns_validation_enabled = $this->settings->is_dns_validation_enabled;
-            $this->is_api_enabled = $this->settings->is_api_enabled;
-            $this->auto_update_frequency = $this->settings->auto_update_frequency;
-            $this->update_check_frequency = $this->settings->update_check_frequency;
-        } else {
+        if (! isInstanceAdmin()) {
             return redirect()->route('dashboard');
+        }
+        $this->settings = instanceSettings();
+        if (! isCloud()) {
+            $this->server = Server::findOrFail(0);
+        }
+        $this->fqdn = $this->settings->fqdn;
+        $this->is_dashboard_force_https_enabled = $this->settings->is_dashboard_force_https_enabled;
+        $this->public_port_min = $this->settings->public_port_min;
+        $this->public_port_max = $this->settings->public_port_max;
+        $this->instance_name = $this->settings->instance_name;
+        $this->public_ipv4 = $this->settings->public_ipv4;
+        $this->public_ipv6 = $this->settings->public_ipv6;
+        $this->instance_timezone = $this->settings->instance_timezone;
+        $this->dev_helper_version = $this->settings->dev_helper_version;
+    }
+
+    #[Computed]
+    public function timezones(): array
+    {
+        return collect(timezone_identifiers_list())
+            ->sort()
+            ->values()
+            ->toArray();
+    }
+
+    public function instantSave($isSave = true)
+    {
+        $this->authorize('update', $this->settings);
+        $this->validate();
+        $this->settings->fqdn = $this->fqdn ? trim($this->fqdn) : $this->fqdn;
+        $this->settings->is_dashboard_force_https_enabled = $this->is_dashboard_force_https_enabled;
+        $this->settings->public_port_min = $this->public_port_min;
+        $this->settings->public_port_max = $this->public_port_max;
+        $this->settings->instance_name = $this->instance_name;
+        $this->settings->public_ipv4 = $this->public_ipv4;
+        $this->settings->public_ipv6 = $this->public_ipv6;
+        $this->settings->instance_timezone = $this->instance_timezone;
+        $this->settings->dev_helper_version = $this->dev_helper_version;
+        if ($isSave) {
+            $this->settings->save();
+            $this->dispatch('success', 'Settings updated!');
         }
     }
 
-    public function instantSave()
+    public function confirmDomainUsage()
     {
-        $this->settings->do_not_track = $this->do_not_track;
-        $this->settings->is_auto_update_enabled = $this->is_auto_update_enabled;
-        $this->settings->is_registration_enabled = $this->is_registration_enabled;
-        $this->settings->is_dns_validation_enabled = $this->is_dns_validation_enabled;
-        $this->settings->is_api_enabled = $this->is_api_enabled;
-        $this->settings->auto_update_frequency = $this->auto_update_frequency;
-        $this->settings->update_check_frequency = $this->update_check_frequency;
-        $this->settings->save();
-        $this->dispatch('success', 'Settings updated!');
+        $this->authorize('update', $this->settings);
+        $this->forceSaveDomains = true;
+        $this->showDomainConflictModal = false;
+        $this->submit();
     }
 
     public function submit()
     {
         try {
+            $this->authorize('update', $this->settings);
             $error_show = false;
-            $this->server = Server::findOrFail(0);
             $this->resetErrorBag();
+
+            if (! validate_timezone($this->instance_timezone)) {
+                $this->instance_timezone = config('app.timezone');
+                throw new \Exception('Invalid timezone.');
+            } else {
+                $this->settings->instance_timezone = $this->instance_timezone;
+            }
+
             if ($this->settings->public_port_min > $this->settings->public_port_max) {
                 $this->addError('settings.public_port_min', 'The minimum port must be lower than the maximum port.');
 
                 return;
             }
+
+            // Trim FQDN to remove leading/trailing whitespace before validation
+            if ($this->fqdn) {
+                $this->fqdn = trim($this->fqdn);
+            }
+
             $this->validate();
 
-            if ($this->is_auto_update_enabled && ! validate_cron_expression($this->auto_update_frequency)) {
-                $this->dispatch('error', 'Invalid Cron / Human expression for Auto Update Frequency.');
-                if (empty($this->auto_update_frequency)) {
-                    $this->auto_update_frequency = '0 0 * * *';
-                }
-
-                return;
-            }
-
-            if (! validate_cron_expression($this->update_check_frequency)) {
-                $this->dispatch('error', 'Invalid Cron / Human expression for Update Check Frequency.');
-                if (empty($this->update_check_frequency)) {
-                    $this->update_check_frequency = '0 * * * *';
-                }
-
-                return;
-            }
-
-            if ($this->settings->is_dns_validation_enabled && $this->settings->fqdn) {
-                if (! validate_dns_entry($this->settings->fqdn, $this->server)) {
-                    $this->dispatch('error', "Validating DNS failed.<br><br>Make sure you have added the DNS records correctly.<br><br>{$this->settings->fqdn}->{$this->server->ip}<br><br>Check this <a target='_blank' class='underline dark:text-white' href='https://coolify.io/docs/knowledge-base/dns-configuration'>documentation</a> for further help.");
+            if ($this->settings->is_dns_validation_enabled && $this->fqdn && $this->server) {
+                if (! validateDNSEntry($this->fqdn, $this->server)) {
+                    $target = serverDnsTargetIp($this->server) ?? $this->server->ip;
+                    $guidance = dnsMismatchGuidanceMessage($target, $target);
+                    $this->dispatch('error', "Validating DNS failed.<br><br>{$guidance}<br><br>Check this <a target='_blank' class='underline dark:text-white' href='https://coolify.io/docs/knowledge-base/dns-configuration'>documentation</a> for further help.");
                     $error_show = true;
                 }
             }
-            if ($this->settings->fqdn) {
-                check_domain_usage(domain: $this->settings->fqdn);
+            if ($this->fqdn) {
+                if (! $this->forceSaveDomains) {
+                    $result = checkDomainUsage(domain: $this->fqdn);
+                    if ($result['hasConflicts']) {
+                        $this->domainConflicts = $result['conflicts'];
+                        $this->showDomainConflictModal = true;
+
+                        return;
+                    }
+                } else {
+                    // Reset the force flag after using it
+                    $this->forceSaveDomains = false;
+                }
             }
-            $this->settings->custom_dns_servers = str($this->settings->custom_dns_servers)->replaceEnd(',', '')->trim();
-            $this->settings->custom_dns_servers = str($this->settings->custom_dns_servers)->trim()->explode(',')->map(function ($dns) {
-                return str($dns)->trim()->lower();
-            });
-            $this->settings->custom_dns_servers = $this->settings->custom_dns_servers->unique();
-            $this->settings->custom_dns_servers = $this->settings->custom_dns_servers->implode(',');
 
-            $this->settings->allowed_ips = str($this->settings->allowed_ips)->replaceEnd(',', '')->trim();
-            $this->settings->allowed_ips = str($this->settings->allowed_ips)->trim()->explode(',')->map(function ($ip) {
-                return str($ip)->trim();
-            });
-            $this->settings->allowed_ips = $this->settings->allowed_ips->unique();
-            $this->settings->allowed_ips = $this->settings->allowed_ips->implode(',');
+            $this->instantSave(isSave: false);
 
-            $this->settings->do_not_track = $this->do_not_track;
-            $this->settings->is_auto_update_enabled = $this->is_auto_update_enabled;
-            $this->settings->is_registration_enabled = $this->is_registration_enabled;
-            $this->settings->is_dns_validation_enabled = $this->is_dns_validation_enabled;
-            $this->settings->is_api_enabled = $this->is_api_enabled;
-            $this->settings->auto_update_frequency = $this->auto_update_frequency;
-            $this->settings->update_check_frequency = $this->update_check_frequency;
             $this->settings->save();
-            $this->server->setupDynamicProxyConfiguration();
+            if ($this->server) {
+                $this->server->setupDynamicProxyConfiguration();
+            }
             if (! $error_show) {
                 $this->dispatch('success', 'Instance settings updated successfully!');
             }
@@ -154,20 +181,52 @@ class Index extends Component
         }
     }
 
-    public function checkManually()
+    public function buildHelperImage()
     {
-        CheckForUpdatesJob::dispatchSync();
-        $this->dispatch('updateAvailable');
-        $settings = InstanceSettings::get();
-        if ($settings->new_version_available) {
-            $this->dispatch('success', 'New version available!');
-        } else {
-            $this->dispatch('success', 'No new version available.');
-        }
-    }
+        try {
+            $this->authorize('update', $this->settings);
+            if (! isDev()) {
+                $this->dispatch('error', 'Building helper image is only available in development mode.');
 
-    public function render()
-    {
-        return view('livewire.settings.index');
+                return;
+            }
+
+            if (! $this->server) {
+                $this->dispatch('error', 'Server not available.');
+
+                return;
+            }
+
+            $this->validateOnly('dev_helper_version');
+
+            $version = $this->dev_helper_version ?: config('constants.coolify.helper_version');
+            if (empty($version)) {
+                $this->dispatch('error', 'Please specify a version to build.');
+
+                return;
+            }
+
+            if (! preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/', (string) $version)) {
+                $this->dispatch('error', 'Invalid helper version format.');
+
+                return;
+            }
+
+            $imageRef = escapeshellarg(coolifyHelperImage().":{$version}");
+            $buildCommand = "docker build -t {$imageRef} -f docker/coolify-helper/Dockerfile .";
+
+            $activity = remote_process(
+                command: [$buildCommand],
+                server: $this->server,
+                type: 'build-helper-image'
+            );
+
+            $this->buildActivityId = $activity->id;
+            $this->dispatch('activityMonitor', $activity->id);
+
+            $this->dispatch('success', "Building coolify-helper:{$version}...");
+        } catch (\Exception $e) {
+            return handleError($e, $this);
+        }
     }
 }

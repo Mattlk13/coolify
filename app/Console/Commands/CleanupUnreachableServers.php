@@ -14,14 +14,17 @@ class CleanupUnreachableServers extends Command
     public function handle()
     {
         echo "Running unreachable server cleanup...\n";
-        $servers = Server::where('unreachable_count', 3)->where('unreachable_notification_sent', true)->where('updated_at', '<', now()->subDays(7))->get();
+        $servers = Server::where('unreachable_count', '>=', 3)->where('unreachable_notification_sent', true)->where('updated_at', '<', now()->subDays(7))->get();
         if ($servers->count() > 0) {
             foreach ($servers as $server) {
                 echo "Cleanup unreachable server ($server->id) with name $server->name";
-                // send_internal_notification("Server $server->name is unreachable for 7 days. Cleaning up...");
-                $server->update([
-                    'ip' => '1.2.3.4',
-                ]);
+                if (isCloud()) {
+                    $server->update([
+                        'ip' => '1.2.3.4',
+                    ]);
+                } else {
+                    $server->forceDisableServer();
+                }
             }
         }
     }

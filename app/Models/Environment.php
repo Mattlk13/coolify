@@ -2,8 +2,9 @@
 
 namespace App\Models;
 
-use Illuminate\Database\Eloquent\Casts\Attribute;
-use Illuminate\Database\Eloquent\Model;
+use App\Traits\ClearsGlobalSearchCache;
+use App\Traits\HasSafeStringAttribute;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use OpenApi\Attributes as OA;
 
 #[OA\Schema(
@@ -18,20 +19,37 @@ use OpenApi\Attributes as OA;
         'description' => ['type' => 'string'],
     ]
 )]
-class Environment extends Model
+class Environment extends BaseModel
 {
-    protected $guarded = [];
+    use ClearsGlobalSearchCache;
+    use HasFactory;
+    use HasSafeStringAttribute;
+
+    protected $fillable = [
+        'name',
+        'description',
+        'project_id',
+        'uuid',
+    ];
 
     protected static function booted()
     {
         static::deleting(function ($environment) {
             $shared_variables = $environment->environment_variables();
             foreach ($shared_variables as $shared_variable) {
-                ray('Deleting environment shared variable: '.$shared_variable->name);
                 $shared_variable->delete();
             }
-
         });
+    }
+
+    public static function ownedByCurrentTeam()
+    {
+        return Environment::whereRelation('project.team', 'id', currentTeam()->id)->orderBy('name');
+    }
+
+    public static function ownedByCurrentTeamAPI(int $teamId)
+    {
+        return Environment::whereRelation('project.team', 'id', $teamId)->orderBy('name');
     }
 
     public function isEmpty()
@@ -50,7 +68,7 @@ class Environment extends Model
 
     public function environment_variables()
     {
-        return $this->hasMany(SharedEnvironmentVariable::class);
+        return $this->hasMany(SharedEnvironmentVariable::class)->where('type', 'environment');
     }
 
     public function applications()
@@ -122,10 +140,8 @@ class Environment extends Model
         return $this->hasMany(Service::class);
     }
 
-    protected function name(): Attribute
+    protected function customizeName($value)
     {
-        return Attribute::make(
-            set: fn (string $value) => str($value)->lower()->trim()->replace('/', '-')->toString(),
-        );
+        return str($value)->lower()->trim()->replace('/', '-')->toString();
     }
 }

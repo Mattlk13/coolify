@@ -2,9 +2,16 @@
 
 namespace App\Models;
 
+use App\Actions\User\RevokeUserTeamTokens;
+use App\Events\ServerReachabilityChanged;
 use App\Notifications\Channels\SendsDiscord;
 use App\Notifications\Channels\SendsEmail;
+use App\Notifications\Channels\SendsPushover;
+use App\Notifications\Channels\SendsSlack;
+use App\Traits\HasNotificationSettings;
+use App\Traits\HasSafeStringAttribute;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Notifications\Notifiable;
 use OpenApi\Attributes as OA;
@@ -19,46 +26,8 @@ use OpenApi\Attributes as OA;
         'personal_team' => ['type' => 'boolean', 'description' => 'Whether the team is personal or not.'],
         'created_at' => ['type' => 'string', 'description' => 'The date and time the team was created.'],
         'updated_at' => ['type' => 'string', 'description' => 'The date and time the team was last updated.'],
-        'smtp_enabled' => ['type' => 'boolean', 'description' => 'Whether SMTP is enabled or not.'],
-        'smtp_from_address' => ['type' => 'string', 'description' => 'The email address to send emails from.'],
-        'smtp_from_name' => ['type' => 'string', 'description' => 'The name to send emails from.'],
-        'smtp_recipients' => ['type' => 'string', 'description' => 'The email addresses to send emails to.'],
-        'smtp_host' => ['type' => 'string', 'description' => 'The SMTP host.'],
-        'smtp_port' => ['type' => 'string', 'description' => 'The SMTP port.'],
-        'smtp_encryption' => ['type' => 'string', 'description' => 'The SMTP encryption.'],
-        'smtp_username' => ['type' => 'string', 'description' => 'The SMTP username.'],
-        'smtp_password' => ['type' => 'string', 'description' => 'The SMTP password.'],
-        'smtp_timeout' => ['type' => 'string', 'description' => 'The SMTP timeout.'],
-        'smtp_notifications_test' => ['type' => 'boolean', 'description' => 'Whether to send test notifications via SMTP.'],
-        'smtp_notifications_deployments' => ['type' => 'boolean', 'description' => 'Whether to send deployment notifications via SMTP.'],
-        'smtp_notifications_status_changes' => ['type' => 'boolean', 'description' => 'Whether to send status change notifications via SMTP.'],
-        'smtp_notifications_scheduled_tasks' => ['type' => 'boolean', 'description' => 'Whether to send scheduled task notifications via SMTP.'],
-        'smtp_notifications_database_backups' => ['type' => 'boolean', 'description' => 'Whether to send database backup notifications via SMTP.'],
-        'discord_enabled' => ['type' => 'boolean', 'description' => 'Whether Discord is enabled or not.'],
-        'discord_webhook_url' => ['type' => 'string', 'description' => 'The Discord webhook URL.'],
-        'discord_notifications_test' => ['type' => 'boolean', 'description' => 'Whether to send test notifications via Discord.'],
-        'discord_notifications_deployments' => ['type' => 'boolean', 'description' => 'Whether to send deployment notifications via Discord.'],
-        'discord_notifications_status_changes' => ['type' => 'boolean', 'description' => 'Whether to send status change notifications via Discord.'],
-        'discord_notifications_database_backups' => ['type' => 'boolean', 'description' => 'Whether to send database backup notifications via Discord.'],
-        'discord_notifications_scheduled_tasks' => ['type' => 'boolean', 'description' => 'Whether to send scheduled task notifications via Discord.'],
         'show_boarding' => ['type' => 'boolean', 'description' => 'Whether to show the boarding screen or not.'],
-        'resend_enabled' => ['type' => 'boolean', 'description' => 'Whether to enable resending or not.'],
-        'resend_api_key' => ['type' => 'string', 'description' => 'The resending API key.'],
-        'use_instance_email_settings' => ['type' => 'boolean', 'description' => 'Whether to use instance email settings or not.'],
-        'telegram_enabled' => ['type' => 'boolean', 'description' => 'Whether Telegram is enabled or not.'],
-        'telegram_token' => ['type' => 'string', 'description' => 'The Telegram token.'],
-        'telegram_chat_id' => ['type' => 'string', 'description' => 'The Telegram chat ID.'],
-        'telegram_notifications_test' => ['type' => 'boolean', 'description' => 'Whether to send test notifications via Telegram.'],
-        'telegram_notifications_deployments' => ['type' => 'boolean', 'description' => 'Whether to send deployment notifications via Telegram.'],
-        'telegram_notifications_status_changes' => ['type' => 'boolean', 'description' => 'Whether to send status change notifications via Telegram.'],
-        'telegram_notifications_database_backups' => ['type' => 'boolean', 'description' => 'Whether to send database backup notifications via Telegram.'],
-        'telegram_notifications_test_message_thread_id' => ['type' => 'string', 'description' => 'The Telegram test message thread ID.'],
-        'telegram_notifications_deployments_message_thread_id' => ['type' => 'string', 'description' => 'The Telegram deployment message thread ID.'],
-        'telegram_notifications_status_changes_message_thread_id' => ['type' => 'string', 'description' => 'The Telegram status change message thread ID.'],
-        'telegram_notifications_database_backups_message_thread_id' => ['type' => 'string', 'description' => 'The Telegram database backup message thread ID.'],
         'custom_server_limit' => ['type' => 'string', 'description' => 'The custom server limit.'],
-        'telegram_notifications_scheduled_tasks' => ['type' => 'boolean', 'description' => 'Whether to send scheduled task notifications via Telegram.'],
-        'telegram_notifications_scheduled_tasks_thread_id' => ['type' => 'string', 'description' => 'The Telegram scheduled task message thread ID.'],
         'members' => new OA\Property(
             property: 'members',
             type: 'array',
@@ -67,53 +36,138 @@ use OpenApi\Attributes as OA;
         ),
     ]
 )]
-class Team extends Model implements SendsDiscord, SendsEmail
-{
-    use Notifiable;
 
-    protected $guarded = [];
+class Team extends Model implements SendsDiscord, SendsEmail, SendsPushover, SendsSlack
+{
+    use HasFactory, HasNotificationSettings, HasSafeStringAttribute, Notifiable;
+
+    protected $fillable = [
+        'name',
+        'description',
+        'personal_team',
+        'show_boarding',
+        'custom_server_limit',
+        'is_mcp_server_enabled',
+    ];
+
+    protected $attributes = [
+        'is_mcp_server_enabled' => true,
+    ];
 
     protected $casts = [
         'personal_team' => 'boolean',
-        'smtp_password' => 'encrypted',
-        'resend_api_key' => 'encrypted',
+        'is_mcp_server_enabled' => 'boolean',
     ];
 
     protected static function booted()
     {
-        static::saving(function ($team) {
+        static::created(function ($team) {
+            $team->emailNotificationSettings()->create([
+                'use_instance_email_settings' => isDev(),
+            ]);
+            $team->discordNotificationSettings()->create();
+            $team->slackNotificationSettings()->create();
+            $team->telegramNotificationSettings()->create();
+            $team->pushoverNotificationSettings()->create();
+            $team->webhookNotificationSettings()->create();
+        });
+
+        static::updating(function ($team) {
             if (auth()->user()?->isMember()) {
                 throw new \Exception('You are not allowed to update this team.');
             }
         });
 
-        static::deleting(function ($team) {
-            $keys = $team->privateKeys;
-            foreach ($keys as $key) {
-                ray('Deleting key: '.$key->name);
+        static::deleting(function (Team $team) {
+            RevokeUserTeamTokens::forTeam($team->id);
+
+            foreach ($team->privateKeys as $key) {
                 $key->delete();
             }
-            $sources = $team->sources();
-            foreach ($sources as $source) {
-                ray('Deleting source: '.$source->name);
+
+            // Transfer instance-wide sources to root team so they remain available
+            GithubApp::where('team_id', $team->id)->where('is_system_wide', true)->update(['team_id' => 0]);
+            GitlabApp::where('team_id', $team->id)->where('is_system_wide', true)->update(['team_id' => 0]);
+
+            // Delete non-instance-wide sources owned by this team
+            $teamSources = GithubApp::where('team_id', $team->id)->get()
+                ->concat(GitlabApp::where('team_id', $team->id)->get());
+            foreach ($teamSources as $source) {
                 $source->delete();
             }
-            $tags = Tag::whereTeamId($team->id)->get();
-            foreach ($tags as $tag) {
-                ray('Deleting tag: '.$tag->name);
+
+            foreach (Tag::whereTeamId($team->id)->get() as $tag) {
                 $tag->delete();
             }
-            $shared_variables = $team->environment_variables();
-            foreach ($shared_variables as $shared_variable) {
-                ray('Deleting team shared variable: '.$shared_variable->name);
-                $shared_variable->delete();
+
+            foreach ($team->environment_variables()->get() as $sharedVariable) {
+                $sharedVariable->delete();
             }
-            $s3s = $team->s3s;
-            foreach ($s3s as $s3) {
-                ray('Deleting s3: '.$s3->name);
+
+            foreach ($team->s3s as $s3) {
                 $s3->delete();
             }
         });
+    }
+
+    public static function serverLimitReached(?Team $team = null)
+    {
+        $team = $team ?? currentTeam();
+        if (! $team) {
+            return true;
+        }
+        $serverLimit = Team::serverLimit($team);
+        $servers = $team->servers->count();
+
+        return $servers >= $serverLimit;
+    }
+
+    public function subscriptionPastOverDue()
+    {
+        if (isCloud()) {
+            return $this->subscription?->stripe_past_due;
+        }
+
+        return false;
+    }
+
+    public function serverOverflow()
+    {
+        if (Team::serverLimit($this) < $this->servers->count()) {
+            return true;
+        }
+
+        return false;
+    }
+
+    public static function serverLimit(?Team $team = null)
+    {
+        $team = $team ?? currentTeam();
+        if (! $team) {
+            return 0;
+        }
+        if ($team->id === 0 && isDev()) {
+            return 9999999;
+        }
+        $team = Team::find($team->id);
+        if (! $team) {
+            return 0;
+        }
+
+        return data_get($team, 'limits', 0);
+    }
+
+    public function limits(): Attribute
+    {
+        return Attribute::make(
+            get: function () {
+                if (config('constants.coolify.self_hosted') || $this->id === 0) {
+                    return 999999999999;
+                }
+
+                return $this->custom_server_limit ?? 2;
+            }
+        );
     }
 
     public function routeNotificationForDiscord()
@@ -129,75 +183,76 @@ class Team extends Model implements SendsDiscord, SendsEmail
         ];
     }
 
-    public function getRecepients($notification)
+    public function routeNotificationForSlack()
     {
-        $recipients = data_get($notification, 'emails', null);
-        if (is_null($recipients)) {
-            $recipients = $this->members()->pluck('email')->toArray();
+        return data_get($this, 'slack_webhook_url', null);
+    }
 
-            return $recipients;
+    public function routeNotificationForPushover()
+    {
+        return [
+            'user' => data_get($this, 'pushover_user_key', null),
+            'token' => data_get($this, 'pushover_api_token', null),
+        ];
+    }
+
+    public function getRecipients(): array
+    {
+        $recipients = $this->members()->pluck('email')->toArray();
+        $validatedEmails = array_filter($recipients, function ($email) {
+            return filter_var($email, FILTER_VALIDATE_EMAIL);
+        });
+        if (is_null($validatedEmails)) {
+            return [];
         }
 
-        return explode(',', $recipients);
+        return array_values($validatedEmails);
     }
 
-    public static function serverLimitReached()
+    public function isAnyNotificationEnabled()
     {
-        $serverLimit = Team::serverLimit();
-        $team = currentTeam();
-        $servers = $team->servers->count();
-
-        return $servers >= $serverLimit;
-    }
-
-    public function serverOverflow()
-    {
-        if ($this->serverLimit() < $this->servers->count()) {
+        if (isCloud()) {
             return true;
         }
 
-        return false;
+        return $this->getNotificationSettings('email')?->isEnabled() ||
+            $this->getNotificationSettings('discord')?->isEnabled() ||
+            $this->getNotificationSettings('slack')?->isEnabled() ||
+            $this->getNotificationSettings('telegram')?->isEnabled() ||
+            $this->getNotificationSettings('pushover')?->isEnabled() ||
+            $this->getNotificationSettings('webhook')?->isEnabled();
     }
 
-    public static function serverLimit()
+    public function subscriptionEnded(?Subscription $subscription = null): void
     {
-        if (currentTeam()->id === 0 && isDev()) {
-            return 9999999;
+        $subscription ??= $this->subscription;
+
+        if (! $subscription) {
+            return;
         }
 
-        return Team::find(currentTeam()->id)->limits['serverLimit'];
-    }
-
-    public function limits(): Attribute
-    {
-        return Attribute::make(
-            get: function () {
-                if (config('coolify.self_hosted') || $this->id === 0) {
-                    $subscription = 'self-hosted';
-                } else {
-                    $subscription = data_get($this, 'subscription');
-                    if (is_null($subscription)) {
-                        $subscription = 'zero';
-                    } else {
-                        $subscription = $subscription->type();
-                    }
-                }
-                if ($this->custom_server_limit) {
-                    $serverLimit = $this->custom_server_limit;
-                } else {
-                    $serverLimit = config('constants.limits.server')[strtolower($subscription)];
-                }
-                $sharedEmailEnabled = config('constants.limits.email')[strtolower($subscription)];
-
-                return ['serverLimit' => $serverLimit, 'sharedEmailEnabled' => $sharedEmailEnabled];
-            }
-
-        );
+        $subscription->update([
+            'stripe_subscription_id' => null,
+            'stripe_cancel_at_period_end' => false,
+            'stripe_invoice_paid' => false,
+            'stripe_trial_already_ended' => false,
+            'stripe_past_due' => false,
+        ]);
+        foreach ($this->servers as $server) {
+            $server->settings()->update([
+                'is_usable' => false,
+                'is_reachable' => false,
+            ]);
+            ServerReachabilityChanged::dispatch($server);
+            $server->unreachable_count = 3;
+            $server->unreachable_notification_sent = true;
+            $server->save();
+        }
     }
 
     public function environment_variables()
     {
-        return $this->hasMany(SharedEnvironmentVariable::class)->whereNull('project_id')->whereNull('environment_id');
+        return $this->hasMany(SharedEnvironmentVariable::class)->where('type', 'team');
     }
 
     public function members()
@@ -220,13 +275,22 @@ class Team extends Model implements SendsDiscord, SendsEmail
         return $this->hasMany(TeamInvitation::class);
     }
 
-    public function isEmpty()
+    /**
+     * @return array<string, int>
+     */
+    public function deletionBlockers(): array
     {
-        if ($this->projects()->count() === 0 && $this->servers()->count() === 0 && $this->privateKeys()->count() === 0 && $this->sources()->count() === 0) {
-            return true;
-        }
+        return array_filter([
+            'projects' => $this->projects()->count(),
+            'servers' => $this->servers()->count(),
+            'sources' => GithubApp::query()->where('team_id', $this->id)->where('is_system_wide', false)->count()
+                + GitlabApp::query()->where('team_id', $this->id)->where('is_system_wide', false)->count(),
+        ]);
+    }
 
-        return false;
+    public function isEmpty(): bool
+    {
+        return $this->deletionBlockers() === [];
     }
 
     public function projects()
@@ -244,14 +308,29 @@ class Team extends Model implements SendsDiscord, SendsEmail
         return $this->hasMany(PrivateKey::class);
     }
 
+    public function cloudProviderTokens()
+    {
+        return $this->hasMany(CloudProviderToken::class);
+    }
+
     public function sources()
     {
         $sources = collect([]);
-        $github_apps = $this->hasMany(GithubApp::class)->whereisPublic(false)->get();
-        $gitlab_apps = $this->hasMany(GitlabApp::class)->whereisPublic(false)->get();
-        $sources = $sources->merge($github_apps)->merge($gitlab_apps);
+        $github_apps = GithubApp::where(function ($query) {
+            $query->where(function ($q) {
+                $q->where('team_id', $this->id)
+                    ->orWhere('is_system_wide', true);
+            })->where('is_public', false);
+        })->get();
 
-        return $sources;
+        $gitlab_apps = GitlabApp::where(function ($query) {
+            $query->where(function ($q) {
+                $q->where('team_id', $this->id)
+                    ->orWhere('is_system_wide', true);
+            })->where('is_public', false);
+        })->get();
+
+        return $sources->merge($github_apps)->merge($gitlab_apps);
     }
 
     public function s3s()
@@ -259,35 +338,33 @@ class Team extends Model implements SendsDiscord, SendsEmail
         return $this->hasMany(S3Storage::class)->where('is_usable', true);
     }
 
-    public function trialEnded()
+    public function emailNotificationSettings()
     {
-        foreach ($this->servers as $server) {
-            $server->settings()->update([
-                'is_usable' => false,
-                'is_reachable' => false,
-            ]);
-        }
+        return $this->hasOne(EmailNotificationSettings::class);
     }
 
-    public function trialEndedButSubscribed()
+    public function discordNotificationSettings()
     {
-        foreach ($this->servers as $server) {
-            $server->settings()->update([
-                'is_usable' => true,
-                'is_reachable' => true,
-            ]);
-        }
+        return $this->hasOne(DiscordNotificationSettings::class);
     }
 
-    public function isAnyNotificationEnabled()
+    public function telegramNotificationSettings()
     {
-        if (isCloud()) {
-            return true;
-        }
-        if ($this->smtp_enabled || $this->resend_enabled || $this->discord_enabled || $this->telegram_enabled || $this->use_instance_email_settings) {
-            return true;
-        }
+        return $this->hasOne(TelegramNotificationSettings::class);
+    }
 
-        return false;
+    public function slackNotificationSettings()
+    {
+        return $this->hasOne(SlackNotificationSettings::class);
+    }
+
+    public function pushoverNotificationSettings()
+    {
+        return $this->hasOne(PushoverNotificationSettings::class);
+    }
+
+    public function webhookNotificationSettings()
+    {
+        return $this->hasOne(WebhookNotificationSettings::class);
     }
 }

@@ -7,32 +7,28 @@ use Illuminate\Broadcasting\PrivateChannel;
 use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Auth;
 
 class ServiceStatusChanged implements ShouldBroadcast
 {
     use Dispatchable, InteractsWithSockets, SerializesModels;
 
-    public ?string $userId = null;
-
-    public function __construct($userId = null)
-    {
-        if (is_null($userId)) {
-            $userId = auth()->user()->id ?? null;
+    public function __construct(
+        public ?int $teamId = null
+    ) {
+        if (is_null($this->teamId) && Auth::check() && Auth::user()->currentTeam()) {
+            $this->teamId = Auth::user()->currentTeam()->id;
         }
-        if (is_null($userId)) {
-            return false;
-        }
-        $this->userId = $userId;
     }
 
-    public function broadcastOn(): ?array
+    public function broadcastOn(): array
     {
-        if (! is_null($this->userId)) {
-            return [
-                new PrivateChannel("user.{$this->userId}"),
-            ];
+        if (is_null($this->teamId)) {
+            return [];
         }
 
-        return null;
+        return [
+            new PrivateChannel("team.{$this->teamId}"),
+        ];
     }
 }

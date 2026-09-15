@@ -3,17 +3,31 @@
 namespace App\Livewire\Project\Database;
 
 use App\Jobs\DatabaseBackupJob;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
 
 class BackupNow extends Component
 {
+    use AuthorizesRequests;
+
     public $backup;
 
-    public function backup_now()
+    public function backupNow()
     {
-        dispatch(new DatabaseBackupJob(
-            backup: $this->backup
-        ));
-        $this->dispatch('success', 'Backup queued. It will be available in a few minutes.');
+        try {
+            $this->authorize('manageBackups', $this->backup->database);
+
+            $database = $this->backup->database->refresh();
+            if ($database->id !== 0 && ! str($database->status)->startsWith('running')) {
+                $this->dispatch('error', 'The database must be running to start a backup.');
+
+                return;
+            }
+
+            DatabaseBackupJob::dispatch($this->backup);
+            $this->dispatch('success', 'Backup queued. It will be available in a few minutes.');
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
     }
 }

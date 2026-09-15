@@ -4,26 +4,31 @@ namespace App\Http\Controllers\Api;
 
 use App\Actions\Database\StartDatabase;
 use App\Actions\Service\StartService;
+use App\Enums\ApplicationDeploymentStatus;
 use App\Http\Controllers\Controller;
+use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
+use App\Models\ApplicationPreview;
 use App\Models\Server;
+use App\Models\Service;
 use App\Models\Tag;
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Http\Request;
 use OpenApi\Attributes as OA;
-use Visus\Cuid2\Cuid2;
 
 class DeployController extends Controller
 {
     private function removeSensitiveData($deployment)
     {
-        $token = auth()->user()->currentAccessToken();
-        if ($token->can('view:sensitive')) {
-            return serializeApiResponse($deployment);
+        if (request()->attributes->get('can_read_sensitive', false) === false) {
+            $deployment->makeHidden([
+                'logs',
+            ]);
+        } else {
+            $deployment->makeVisible([
+                'logs',
+            ]);
         }
-
-        $deployment->makeHidden([
-            'logs',
-        ]);
 
         return serializeApiResponse($deployment);
     }
@@ -32,6 +37,7 @@ class DeployController extends Controller
         summary: 'List',
         description: 'List currently running deployments',
         path: '/deployments',
+        operationId: 'list-deployments',
         security: [
             ['bearerAuth' => []],
         ],
@@ -79,12 +85,13 @@ class DeployController extends Controller
         summary: 'Get',
         description: 'Get deployment by UUID.',
         path: '/deployments/{uuid}',
+        operationId: 'get-deployment-by-uuid',
         security: [
             ['bearerAuth' => []],
         ],
         tags: ['Deployments'],
         parameters: [
-            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Deployment Uuid', schema: new OA\Schema(type: 'string')),
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Deployment UUID', schema: new OA\Schema(type: 'string')),
         ],
         responses: [
             new OA\Response(
@@ -126,14 +133,204 @@ class DeployController extends Controller
         if (! $deployment) {
             return response()->json(['message' => 'Deployment not found.'], 404);
         }
+        $application = $deployment->application;
+        if (! $application || data_get($application->team(), 'id') !== (int) $teamId) {
+            return response()->json(['message' => 'Deployment not found.'], 404);
+        }
 
         return response()->json($this->removeSensitiveData($deployment));
     }
 
-    #[OA\Get(
+    #[OA\Post(
+        summary: 'Cancel',
+        description: 'Cancel a deployment by UUID.',
+        path: '/deployments/{uuid}/cancel',
+        operationId: 'cancel-deployment-by-uuid',
+        security: [
+            ['bearerAuth' => []],
+        ],
+        tags: ['Deployments'],
+        parameters: [
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Deployment UUID', schema: new OA\Schema(type: 'string')),
+        ],
+        responses: [
+            new OA\Response(
+                response: 200,
+                description: 'Deployment cancelled successfully.',
+                content: [
+                    new OA\MediaType(
+                        mediaType: 'application/json',
+                        schema: new OA\Schema(
+                            type: 'object',
+                            properties: [
+                                'message' => ['type' => 'string', 'example' => 'Deployment cancelled successfully.'],
+                                'deployment_uuid' => ['type' => 'string', 'example' => 'cm37r6cqj000008jm0veg5tkm'],
+                                'status' => ['type' => 'string', 'example' => 'cancelled-by-user'],
+                            ]
+                        )
+                    ),
+                ]),
+            new OA\Response(
+                response: 400,
+                description: 'Deployment cannot be cancelled (already finished/failed/cancelled).',
+                content: [
+                    new OA\MediaType(
+                        mediaType: 'application/json',
+                        schema: new OA\Schema(
+                            type: 'object',
+                            properties: [
+                                'message' => ['type' => 'string', 'example' => 'Deployment cannot be cancelled. Current status: finished'],
+                            ]
+                        )
+                    ),
+                ]),
+            new OA\Response(
+                response: 401,
+                ref: '#/components/responses/401',
+            ),
+            new OA\Response(
+                response: 403,
+                description: 'User doesn\'t have permission to cancel this deployment.',
+                content: [
+                    new OA\MediaType(
+                        mediaType: 'application/json',
+                        schema: new OA\Schema(
+                            type: 'object',
+                            properties: [
+                                'message' => ['type' => 'string', 'example' => 'You do not have permission to cancel this deployment.'],
+                            ]
+                        )
+                    ),
+                ]),
+            new OA\Response(
+                response: 404,
+                ref: '#/components/responses/404',
+            ),
+        ]
+    )]
+    public function cancel_deployment(Request $request)
+    {
+        $teamId = getTeamIdFromToken();
+        if (is_null($teamId)) {
+            return invalidTokenResponse();
+        }
+
+        $uuid = $request->route('uuid');
+        if (! $uuid) {
+            return response()->json(['message' => 'UUID is required.'], 400);
+        }
+
+        // Find the deployment by UUID
+        $deployment = ApplicationDeploymentQueue::where('deployment_uuid', $uuid)->first();
+        if (! $deployment) {
+            return response()->json(['message' => 'Deployment not found.'], 404);
+        }
+
+        // Check if the deployment belongs to the user's team
+        $servers = Server::whereTeamId($teamId)->pluck('id');
+        if (! $servers->contains($deployment->server_id)) {
+            return response()->json(['message' => 'You do not have permission to cancel this deployment.'], 403);
+        }
+
+        // Check if deployment can be cancelled (must be queued or in_progress)
+        $cancellableStatuses = [
+            ApplicationDeploymentStatus::QUEUED->value,
+            ApplicationDeploymentStatus::IN_PROGRESS->value,
+        ];
+
+        if (! in_array($deployment->status, $cancellableStatuses, true)) {
+            return response()->json([
+                'message' => "Deployment cannot be cancelled. Current status: {$deployment->status}",
+            ], 400);
+        }
+
+        // Perform the cancellation
+        $cancelled = false;
+        $deploymentServer = Server::whereTeamId($teamId)->find($deployment->server_id);
+
+        try {
+            $deployment_uuid = $deployment->deployment_uuid;
+            $kill_command = "docker rm -f {$deployment_uuid}";
+            $build_server_id = $deployment->build_server_id ?? $deployment->server_id;
+
+            // Mark deployment as cancelled
+            $updated = ApplicationDeploymentQueue::whereKey($deployment->getKey())
+                ->whereIn('status', $cancellableStatuses)
+                ->update(['status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value]);
+
+            if ($updated !== 1) {
+                $deployment->refresh();
+
+                return response()->json([
+                    'message' => "Deployment cannot be cancelled. Current status: {$deployment->status}",
+                ], 400);
+            }
+
+            $deployment->status = ApplicationDeploymentStatus::CANCELLED_BY_USER->value;
+            $cancelled = true;
+
+            // Get the server
+            $server = Server::whereTeamId($teamId)->find($build_server_id);
+
+            try {
+                if ($server) {
+                    // Add cancellation log entry
+                    $deployment->addLogEntry('Deployment cancelled by user via API.', 'stderr');
+
+                    // Check if container exists and kill it
+                    $checkCommand = "docker ps -a --filter name={$deployment_uuid} --format '{{.Names}}'";
+                    $containerExists = instant_remote_process([$checkCommand], $server);
+
+                    if ($containerExists && str($containerExists)->trim()->isNotEmpty()) {
+                        instant_remote_process([$kill_command], $server);
+                        $deployment->addLogEntry('Deployment container stopped.');
+                    } else {
+                        $deployment->addLogEntry('Deployment container not yet started. Will be cancelled when job checks status.');
+                    }
+
+                    // Kill running process if process ID exists
+                    if ($deployment->current_process_id) {
+                        $processKillCommand = "kill -9 {$deployment->current_process_id}";
+                        instant_remote_process([$processKillCommand], $server);
+                    }
+                }
+            } catch (\Throwable $e) {
+                \Log::warning("Failed to clean up cancelled deployment {$deployment->id}: {$e->getMessage()}");
+            }
+
+            auditLog('api.deployment.cancelled', [
+                'team_id' => $teamId,
+                'deployment_uuid' => $deployment->deployment_uuid,
+                'application_id' => $deployment->application_id,
+                'application_uuid' => $deployment->application?->uuid,
+                'server_id' => $deployment->server_id,
+            ]);
+
+            return response()->json([
+                'message' => 'Deployment cancelled successfully.',
+                'deployment_uuid' => $deployment->deployment_uuid,
+                'status' => $deployment->status,
+            ]);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to cancel deployment: '.$e->getMessage(),
+            ], 500);
+        } finally {
+            if ($cancelled) {
+                try {
+                    next_after_cancel($deploymentServer);
+                } catch (\Throwable $e) {
+                    \Log::warning("Failed to advance deployment queue after cancelling deployment {$deployment->id}: {$e->getMessage()}");
+                }
+            }
+        }
+    }
+
+    #[OA\Post(
         summary: 'Deploy',
-        description: 'Deploy by tag or uuid. `Post` request also accepted.',
+        description: 'Deploy by tag or UUID using query parameters or a JSON body.',
         path: '/deploy',
+        operationId: 'deploy-by-tag-or-uuid',
         security: [
             ['bearerAuth' => []],
         ],
@@ -142,12 +339,15 @@ class DeployController extends Controller
             new OA\Parameter(name: 'tag', in: 'query', description: 'Tag name(s). Comma separated list is also accepted.', schema: new OA\Schema(type: 'string')),
             new OA\Parameter(name: 'uuid', in: 'query', description: 'Resource UUID(s). Comma separated list is also accepted.', schema: new OA\Schema(type: 'string')),
             new OA\Parameter(name: 'force', in: 'query', description: 'Force rebuild (without cache)', schema: new OA\Schema(type: 'boolean')),
+            new OA\Parameter(name: 'pr', in: 'query', description: 'Pull Request Id for deploying specific PR builds. Cannot be used with tag parameter.', schema: new OA\Schema(type: 'integer')),
+            new OA\Parameter(name: 'pull_request_id', in: 'query', description: 'Preview deployment identifier. Alias of pr.', schema: new OA\Schema(type: 'integer')),
+            new OA\Parameter(name: 'docker_tag', in: 'query', description: 'Docker image tag for Docker Image preview deployments. Requires pull_request_id.', schema: new OA\Schema(type: 'string')),
         ],
 
         responses: [
             new OA\Response(
                 response: 200,
-                description: 'Get deployment(s) Uuid\'s',
+                description: 'Get deployment(s) UUID\'s',
                 content: [
                     new OA\MediaType(
                         mediaType: 'application/json',
@@ -184,26 +384,40 @@ class DeployController extends Controller
     public function deploy(Request $request)
     {
         $teamId = getTeamIdFromToken();
-        $uuids = $request->query->get('uuid');
-        $tags = $request->query->get('tag');
-        $force = $request->query->get('force') ?? false;
+
+        if (is_null($teamId)) {
+            return invalidTokenResponse();
+        }
+
+        $uuids = $request->input('uuid');
+        $tags = $request->input('tag');
+        $force = $request->boolean('force');
+        $pullRequestId = $request->input('pull_request_id', $request->input('pr'));
+        $pr = $pullRequestId ? max((int) $pullRequestId, 0) : 0;
+        $dockerTag = $request->string('docker_tag')->trim()->value() ?: null;
 
         if ($uuids && $tags) {
             return response()->json(['message' => 'You can only use uuid or tag, not both.'], 400);
         }
-        if (is_null($teamId)) {
-            return invalidTokenResponse();
+        if ($tags && $pr) {
+            return response()->json(['message' => 'You can only use tag or pr, not both.'], 400);
+        }
+        if ($dockerTag && $pr === 0) {
+            return response()->json(['message' => 'docker_tag requires pull_request_id.'], 400);
+        }
+        if ($dockerTag && $tags) {
+            return response()->json(['message' => 'You can only use tag or docker_tag, not both.'], 400);
         }
         if ($tags) {
             return $this->by_tags($tags, $teamId, $force);
         } elseif ($uuids) {
-            return $this->by_uuids($uuids, $teamId, $force);
+            return $this->by_uuids($uuids, $teamId, $force, $pr, $dockerTag);
         }
 
         return response()->json(['message' => 'You must provide uuid or tag.'], 400);
     }
 
-    private function by_uuids(string $uuid, int $teamId, bool $force = false)
+    private function by_uuids(string $uuid, int $teamId, bool $force = false, int $pr = 0, ?string $dockerTag = null)
     {
         $uuids = explode(',', $uuid);
         $uuids = collect(array_filter($uuids));
@@ -216,9 +430,28 @@ class DeployController extends Controller
         foreach ($uuids as $uuid) {
             $resource = getResourceByUuid($uuid, $teamId);
             if ($resource) {
-                ['message' => $return_message, 'deployment_uuid' => $deployment_uuid] = $this->deploy_resource($resource, $force);
+                $dockerTagForResource = $dockerTag;
+                if ($pr !== 0) {
+                    $preview = null;
+                    if ($resource instanceof Application && $resource->build_pack === 'dockerimage') {
+                        $preview = $this->upsertDockerImagePreview($resource, $pr, $dockerTag);
+                        $dockerTagForResource = $preview?->docker_registry_image_tag;
+                    } else {
+                        $preview = $resource->previews()->where('pull_request_id', $pr)->first();
+                    }
+                    if (! $preview) {
+                        $deployments->push(['message' => "Pull request {$pr} not found for this resource.", 'resource_uuid' => $uuid]);
+
+                        continue;
+                    }
+                }
+                $result = $this->deploy_resource($resource, $force, $pr, $dockerTagForResource);
+                if (isset($result['status']) && $result['status'] === 429) {
+                    return response()->json(['message' => $result['message']], 429)->header('Retry-After', 60);
+                }
+                ['message' => $return_message, 'deployment_uuid' => $deployment_uuid] = $result;
                 if ($deployment_uuid) {
-                    $deployments->push(['message' => $return_message, 'resource_uuid' => $uuid, 'deployment_uuid' => $deployment_uuid->toString()]);
+                    $deployments->push(['message' => $return_message, 'resource_uuid' => $uuid, 'deployment_uuid' => $deployment_uuid]);
                 } else {
                     $deployments->push(['message' => $return_message, 'resource_uuid' => $uuid]);
                 }
@@ -258,9 +491,13 @@ class DeployController extends Controller
                 continue;
             }
             foreach ($applications as $resource) {
-                ['message' => $return_message, 'deployment_uuid' => $deployment_uuid] = $this->deploy_resource($resource, $force);
+                $result = $this->deploy_resource($resource, $force);
+                if (isset($result['status']) && $result['status'] === 429) {
+                    return response()->json(['message' => $result['message']], 429)->header('Retry-After', 60);
+                }
+                ['message' => $return_message, 'deployment_uuid' => $deployment_uuid] = $result;
                 if ($deployment_uuid) {
-                    $deployments->push(['resource_uuid' => $resource->uuid, 'deployment_uuid' => $deployment_uuid->toString()]);
+                    $deployments->push(['resource_uuid' => $resource->uuid, 'deployment_uuid' => $deployment_uuid]);
                 }
                 $message = $message->merge($return_message);
             }
@@ -281,7 +518,7 @@ class DeployController extends Controller
         return response()->json(['message' => 'No resources found with this tag.'], 404);
     }
 
-    public function deploy_resource($resource, bool $force = false): array
+    public function deploy_resource($resource, bool $force = false, int $pr = 0, ?string $dockerTag = null): array
     {
         $message = null;
         $deployment_uuid = null;
@@ -289,29 +526,208 @@ class DeployController extends Controller
             return ['message' => "Resource ($resource) not found.", 'deployment_uuid' => $deployment_uuid];
         }
         switch ($resource?->getMorphClass()) {
-            case 'App\Models\Application':
-                $deployment_uuid = new Cuid2;
-                queue_application_deployment(
+            case Application::class:
+                // Check authorization for application deployment
+                try {
+                    $this->authorize('deploy', $resource);
+                } catch (AuthorizationException $e) {
+                    return ['message' => 'Unauthorized to deploy this application.', 'deployment_uuid' => null];
+                }
+                if ($dockerTag !== null && $resource->build_pack !== 'dockerimage') {
+                    return ['message' => 'docker_tag can only be used with Docker Image applications.', 'deployment_uuid' => null];
+                }
+                $deployment_uuid = new_public_id();
+                $result = queue_application_deployment(
                     application: $resource,
                     deployment_uuid: $deployment_uuid,
                     force_rebuild: $force,
+                    pull_request_id: $pr,
+                    is_api: true,
+                    docker_registry_image_tag: $dockerTag,
                 );
-                $message = "Application {$resource->name} deployment queued.";
+                if ($result['status'] === 'queue_full') {
+                    return ['message' => $result['message'], 'deployment_uuid' => null, 'status' => 429];
+                } elseif ($result['status'] === 'skipped') {
+                    $message = $result['message'];
+                } else {
+                    $message = "Application {$resource->name} deployment queued.";
+                    auditLog('api.deployment.triggered', [
+                        'resource_type' => 'application',
+                        'application_uuid' => $resource->uuid,
+                        'application_name' => $resource->name,
+                        'deployment_uuid' => $deployment_uuid,
+                        'force_rebuild' => $force,
+                        'pull_request_id' => $pr,
+                    ]);
+                }
                 break;
-            case 'App\Models\Service':
+            case Service::class:
+                // Check authorization for service deployment
+                try {
+                    $this->authorize('deploy', $resource);
+                } catch (AuthorizationException $e) {
+                    return ['message' => 'Unauthorized to deploy this service.', 'deployment_uuid' => null];
+                }
                 StartService::run($resource);
                 $message = "Service {$resource->name} started. It could take a while, be patient.";
+                auditLog('api.service.deployed', [
+                    'service_uuid' => $resource->uuid,
+                    'service_name' => $resource->name,
+                ]);
                 break;
             default:
-                // Database resource
+                // Database resource - check authorization
+                try {
+                    $this->authorize('manage', $resource);
+                } catch (AuthorizationException $e) {
+                    return ['message' => 'Unauthorized to start this database.', 'deployment_uuid' => null];
+                }
                 StartDatabase::dispatch($resource);
-                $resource->update([
-                    'started_at' => now(),
-                ]);
+
+                $resource->started_at ??= now();
+                $resource->save();
+
                 $message = "Database {$resource->name} started.";
+                auditLog('api.database.started', [
+                    'database_uuid' => $resource->uuid,
+                    'database_name' => $resource->name,
+                    'database_type' => $resource->getMorphClass(),
+                ]);
                 break;
         }
 
         return ['message' => $message, 'deployment_uuid' => $deployment_uuid];
+    }
+
+    private function upsertDockerImagePreview(Application $application, int $pullRequestId, ?string $dockerTag): ?ApplicationPreview
+    {
+        $preview = $application->previews()->where('pull_request_id', $pullRequestId)->first();
+
+        if (! $preview && $dockerTag === null) {
+            return null;
+        }
+
+        if (! $preview) {
+            $preview = ApplicationPreview::create([
+                'application_id' => $application->id,
+                'pull_request_id' => $pullRequestId,
+                'pull_request_html_url' => '',
+                'docker_registry_image_tag' => $dockerTag,
+            ]);
+            $preview->generate_preview_fqdn();
+
+            return $preview;
+        }
+
+        if ($dockerTag !== null && $preview->docker_registry_image_tag !== $dockerTag) {
+            $preview->docker_registry_image_tag = $dockerTag;
+            $preview->save();
+        }
+
+        return $preview;
+    }
+
+    #[OA\Get(
+        summary: 'List application deployments',
+        description: 'List application deployments by using the app uuid',
+        path: '/deployments/applications/{uuid}',
+        operationId: 'list-deployments-by-app-uuid',
+        security: [
+            ['bearerAuth' => []],
+        ],
+        tags: ['Deployments'],
+        parameters: [
+            new OA\Parameter(
+                name: 'uuid',
+                in: 'path',
+                description: 'UUID of the application.',
+                required: true,
+                schema: new OA\Schema(
+                    type: 'string',
+                )
+            ),
+            new OA\Parameter(
+                name: 'skip',
+                in: 'query',
+                description: 'Number of records to skip.',
+                required: false,
+                schema: new OA\Schema(
+                    type: 'integer',
+                    minimum: 0,
+                    default: 0,
+                )
+            ),
+            new OA\Parameter(
+                name: 'take',
+                in: 'query',
+                description: 'Number of records to take.',
+                required: false,
+                schema: new OA\Schema(
+                    type: 'integer',
+                    minimum: 1,
+                    default: 10,
+                )
+            ),
+        ],
+        responses: [
+            new OA\Response(
+                response: 200,
+                description: 'List application deployments by using the app uuid.',
+                content: [
+
+                    new OA\MediaType(
+                        mediaType: 'application/json',
+                        schema: new OA\Schema(
+                            type: 'array',
+                            items: new OA\Items(ref: '#/components/schemas/Application'),
+                        )
+                    ),
+                ]),
+            new OA\Response(
+                response: 401,
+                ref: '#/components/responses/401',
+            ),
+            new OA\Response(
+                response: 400,
+                ref: '#/components/responses/400',
+            ),
+        ]
+    )]
+    public function get_application_deployments(Request $request)
+    {
+        $request->validate([
+            'skip' => ['nullable', 'integer', 'min:0'],
+            'take' => ['nullable', 'integer', 'min:1'],
+        ]);
+
+        $app_uuid = $request->route('uuid', null);
+        $skip = $request->get('skip', 0);
+        $take = $request->get('take', 10);
+
+        $teamId = getTeamIdFromToken();
+        if (is_null($teamId)) {
+            return invalidTokenResponse();
+        }
+        $servers = Server::whereTeamId($teamId)->get();
+
+        if (is_null($app_uuid)) {
+            return response()->json(['message' => 'Application uuid is required'], 400);
+        }
+
+        $application = Application::ownedByCurrentTeamAPI($teamId)->where('uuid', $app_uuid)->first();
+
+        if (is_null($application)) {
+            return response()->json(['message' => 'Application not found'], 404);
+        }
+
+        // Check authorization to view application deployments
+        $this->authorize('view', $application);
+
+        $deployments = $application->deployments($skip, $take);
+        if ($request->attributes->get('can_read_sensitive', false) === true) {
+            $deployments['deployments']->each->makeVisible(['logs']);
+        }
+
+        return response()->json($deployments);
     }
 }

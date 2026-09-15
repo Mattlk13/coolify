@@ -3,56 +3,185 @@
 namespace App\Livewire\Project\Application;
 
 use App\Models\Application;
+use App\Models\GithubApp;
+use App\Models\GitlabApp;
 use App\Models\PrivateKey;
+use App\Rules\ValidGitBranch;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Livewire\Attributes\Locked;
+use Livewire\Attributes\Validate;
 use Livewire\Component;
 
 class Source extends Component
 {
-    public $applicationId;
+    use AuthorizesRequests;
 
     public Application $application;
 
-    public $private_keys;
+    #[Locked]
+    public $privateKeys;
 
-    protected $rules = [
-        'application.git_repository' => 'required',
-        'application.git_branch' => 'required',
-        'application.git_commit_sha' => 'nullable',
-    ];
+    #[Validate(['nullable', 'string'])]
+    public ?string $privateKeyName = null;
 
-    protected $validationAttributes = [
-        'application.git_repository' => 'repository',
-        'application.git_branch' => 'branch',
-        'application.git_commit_sha' => 'commit sha',
-    ];
+    #[Locked]
+    public ?int $privateKeyId = null;
+
+    #[Validate(['required', 'string'])]
+    public string $gitRepository;
+
+    #[Validate(['required', 'string', new ValidGitBranch])]
+    public string $gitBranch;
+
+    #[Validate(['nullable', 'string', 'regex:/^[a-zA-Z0-9][a-zA-Z0-9._\-\/]*$/'])]
+    public ?string $gitCommitSha = null;
+
+    #[Locked]
+    public $sources;
 
     public function mount()
     {
-        $this->get_private_keys();
+        try {
+            $this->syncData();
+            $this->getPrivateKeys();
+            $this->getSources();
+        } catch (\Throwable $e) {
+            handleError($e, $this);
+        }
     }
 
-    private function get_private_keys()
+    public function updatedGitRepository()
     {
-        $this->private_keys = PrivateKey::whereTeamId(currentTeam()->id)->get()->reject(function ($key) {
-            return $key->id == $this->application->private_key_id;
+        $this->gitRepository = trim($this->gitRepository);
+    }
+
+    public function updatedGitBranch()
+    {
+        $this->gitBranch = trim($this->gitBranch);
+    }
+
+    public function updatedGitCommitSha()
+    {
+        $this->gitCommitSha = trim($this->gitCommitSha);
+    }
+
+    private function syncData(bool $toModel = false): void
+    {
+        if ($toModel) {
+            $this->validate();
+            $this->application->update([
+                'git_repository' => $this->gitRepository,
+                'git_branch' => $this->gitBranch,
+                'git_commit_sha' => $this->gitCommitSha,
+                'private_key_id' => $this->privateKeyId,
+            ]);
+            // Refresh to get the trimmed values from the model
+            $this->application->refresh();
+            $this->syncData(false);
+        } else {
+            $this->gitRepository = $this->application->git_repository;
+            $this->gitBranch = $this->application->git_branch;
+            $this->gitCommitSha = $this->application->git_commit_sha;
+            $this->privateKeyId = $this->application->private_key_id;
+            $this->privateKeyName = data_get($this->application, 'private_key.name');
+        }
+    }
+
+    private function getPrivateKeys()
+    {
+        $this->privateKeys = PrivateKey::whereTeamId(currentTeam()->id)->get()->reject(function ($key) {
+            return $key->id == $this->privateKeyId;
         });
     }
 
-    public function setPrivateKey(int $private_key_id)
+    private function getSources()
     {
-        $this->application->private_key_id = $private_key_id;
-        $this->application->save();
-        $this->application->refresh();
-        $this->get_private_keys();
+        $this->sources = currentTeam()->sources()->filter(function ($source) {
+            if ($source->id === $this->application->source_id
+                && $source->getMorphClass() === $this->application->source_type) {
+                return false;
+            }
+            if ($source instanceof GithubApp) {
+                return ! is_null($source->app_id);
+            }
+            if ($source instanceof GitlabApp) {
+                return $source->isConnected();
+            }
+
+            return true;
+        })->sortBy('name');
+    }
+
+    public function setPrivateKey(int $privateKeyId)
+    {
+        try {
+            $this->authorize('update', $this->application);
+            $key = PrivateKey::ownedByCurrentTeam()->findOrFail($privateKeyId);
+            $this->privateKeyId = $key->id;
+            $this->syncData(true);
+            $this->getPrivateKeys();
+            $this->application->refresh();
+            $this->privateKeyName = $this->application->private_key->name;
+            $this->dispatch('success', 'Private key updated!');
+            $this->dispatch('configurationChanged');
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
     }
 
     public function submit()
     {
-        $this->validate();
-        if (! $this->application->git_commit_sha) {
-            $this->application->git_commit_sha = 'HEAD';
+
+        try {
+            $this->authorize('update', $this->application);
+            if (str($this->gitCommitSha)->isEmpty()) {
+                $this->gitCommitSha = 'HEAD';
+            }
+            $this->syncData(true);
+            $this->dispatch('success', 'Application source updated!');
+            $this->dispatch('configurationChanged');
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
         }
-        $this->application->save();
-        $this->dispatch('success', 'Application source updated!');
+    }
+
+    public function changeSource($sourceId, $sourceType)
+    {
+        try {
+            $this->authorize('update', $this->application);
+            $allowedSourceTypes = [GithubApp::class, GitlabApp::class];
+            abort_unless(in_array($sourceType, $allowedSourceTypes, true), 404);
+            $source = $sourceType::ownedByCurrentTeam()->findOrFail($sourceId);
+            $this->application->update([
+                'source_id' => $source->id,
+                'source_type' => $sourceType,
+            ]);
+            $this->dispatch('configurationChanged');
+
+            ['repository' => $customRepository] = $this->application->customRepository();
+            $repository_project_id = null;
+
+            if ($sourceType === GithubApp::class) {
+                $repository = githubApi($source, "repos/{$customRepository}");
+                $repository_project_id = data_get($repository, 'data.id');
+            } elseif ($sourceType === GitlabApp::class) {
+                if ($source->isConnected()) {
+                    $encoded = urlencode($customRepository);
+                    $project = gitlabApi($source, "/projects/{$encoded}");
+                    $repository_project_id = data_get($project, 'data.id');
+                }
+            }
+
+            if (isset($repository_project_id) && $this->application->repository_project_id !== $repository_project_id) {
+                $this->application->repository_project_id = $repository_project_id;
+                $this->application->save();
+            }
+
+            $this->application->refresh();
+            $this->getSources();
+            $this->dispatch('success', 'Source updated!');
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
     }
 }

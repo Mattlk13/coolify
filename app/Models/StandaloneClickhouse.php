@@ -2,22 +2,80 @@
 
 namespace App\Models;
 
+use App\Traits\ClearsGlobalSearchCache;
+use App\Traits\HasDatabaseHealthCheck;
+use App\Traits\HasMetrics;
+use App\Traits\HasSafeStringAttribute;
 use Illuminate\Database\Eloquent\Casts\Attribute;
-use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
-use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
 class StandaloneClickhouse extends BaseModel
 {
-    use HasFactory, SoftDeletes;
+    use ClearsGlobalSearchCache, HasDatabaseHealthCheck, HasFactory, HasMetrics, HasSafeStringAttribute, SoftDeletes;
 
-    protected $guarded = [];
+    protected $fillable = [
+        'uuid',
+        'name',
+        'description',
+        'clickhouse_admin_user',
+        'clickhouse_admin_password',
+        'is_log_drain_enabled',
+        'is_include_timestamps',
+        'status',
+        'image',
+        'is_public',
+        'public_port',
+        'ports_mappings',
+        'limits_memory',
+        'limits_memory_swap',
+        'limits_memory_swappiness',
+        'limits_memory_reservation',
+        'limits_cpus',
+        'limits_cpuset',
+        'limits_cpu_shares',
+        'started_at',
+        'restart_count',
+        'last_restart_at',
+        'last_restart_type',
+        'last_online_at',
+        'public_port_timeout',
+        'custom_docker_run_options',
+        'clickhouse_db',
+        'destination_type',
+        'destination_id',
+        'environment_id',
+        'health_check_enabled',
+        'health_check_interval',
+        'health_check_timeout',
+        'health_check_retries',
+        'health_check_start_period',
+    ];
 
     protected $appends = ['internal_db_url', 'external_db_url', 'database_type', 'server_status'];
 
+    /**
+     * Sensitive fields hidden by default in serialized output (toArray/toJson).
+     * API controllers should call makeVisible([...]) for callers with the
+     * `read:sensitive` or `root` token ability.
+     */
+    protected $hidden = [
+        'clickhouse_admin_password',
+        'internal_db_url',
+        'external_db_url',
+    ];
+
     protected $casts = [
-        'clickhouse_password' => 'encrypted',
+        'health_check_enabled' => 'boolean',
+        'health_check_interval' => 'integer',
+        'health_check_timeout' => 'integer',
+        'health_check_retries' => 'integer',
+        'health_check_start_period' => 'integer',
+        'clickhouse_admin_password' => 'encrypted',
+        'public_port_timeout' => 'integer',
+        'restart_count' => 'integer',
+        'last_restart_at' => 'datetime',
+        'last_restart_type' => 'string',
     ];
 
     protected static function booted()
@@ -25,11 +83,10 @@ class StandaloneClickhouse extends BaseModel
         static::created(function ($database) {
             LocalPersistentVolume::create([
                 'name' => 'clickhouse-data-'.$database->uuid,
-                'mount_path' => '/bitnami/clickhouse',
+                'mount_path' => '/var/lib/clickhouse',
                 'host_path' => null,
                 'resource_id' => $database->id,
                 'resource_type' => $database->getMorphClass(),
-                'is_readonly' => true,
             ]);
         });
         static::forceDeleting(function ($database) {
@@ -37,6 +94,30 @@ class StandaloneClickhouse extends BaseModel
             $database->scheduledBackups()->delete();
             $database->environment_variables()->delete();
             $database->tags()->detach();
+        });
+        static::saving(function ($database) {
+            if ($database->isDirty('status')) {
+                $database->last_online_at = now();
+            }
+        });
+    }
+
+    /**
+     * Get query builder for ClickHouse databases owned by current team.
+     * If you need all databases without further query chaining, use ownedByCurrentTeamCached() instead.
+     */
+    public static function ownedByCurrentTeam()
+    {
+        return StandaloneClickhouse::whereRelation('environment.project.team', 'id', currentTeam()->id)->orderBy('name');
+    }
+
+    /**
+     * Get all ClickHouse databases owned by current team (cached for request duration).
+     */
+    public static function ownedByCurrentTeamCached()
+    {
+        return once(function () {
+            return StandaloneClickhouse::ownedByCurrentTeam()->get();
         });
     }
 
@@ -52,7 +133,8 @@ class StandaloneClickhouse extends BaseModel
     public function isConfigurationChanged(bool $save = false)
     {
         $newConfigHash = $this->image.$this->ports_mappings;
-        $newConfigHash .= json_encode($this->environment_variables()->get('value')->sort());
+        $newConfigHash .= $this->healthCheckConfigurationHash();
+        $newConfigHash .= json_encode($this->environment_variables()->get('value')->makeVisible('value')->sort());
         $newConfigHash = md5($newConfigHash);
         $oldConfigHash = data_get($this, 'config_hash');
         if ($oldConfigHash === null) {
@@ -75,6 +157,11 @@ class StandaloneClickhouse extends BaseModel
         }
     }
 
+    public function isRunning()
+    {
+        return (bool) str($this->status)->contains('running');
+    }
+
     public function isExited()
     {
         return (bool) str($this->status)->startsWith('exited');
@@ -85,7 +172,7 @@ class StandaloneClickhouse extends BaseModel
         return database_configuration_dir()."/{$this->uuid}";
     }
 
-    public function delete_configurations()
+    public function deleteConfigurations()
     {
         $server = data_get($this, 'destination.server');
         $workdir = $this->workdir();
@@ -94,14 +181,15 @@ class StandaloneClickhouse extends BaseModel
         }
     }
 
-    public function delete_volumes(Collection $persistentStorages)
+    public function deleteVolumes()
     {
+        $persistentStorages = $this->persistentStorages()->get() ?? collect();
         if ($persistentStorages->count() === 0) {
             return;
         }
         $server = data_get($this, 'destination.server');
         foreach ($persistentStorages as $storage) {
-            instant_remote_process(["docker volume rm -f $storage->name"], $server, false);
+            instant_remote_process(['docker volume rm -f '.escapeshellarg($storage->name)], $server, false);
         }
     }
 
@@ -154,12 +242,17 @@ class StandaloneClickhouse extends BaseModel
         return data_get($this, 'environment.project');
     }
 
+    public function sslCertificates()
+    {
+        return $this->morphMany(SslCertificate::class, 'resource');
+    }
+
     public function link()
     {
         if (data_get($this, 'environment.project.uuid')) {
             return route('project.database.configuration', [
                 'project_uuid' => data_get($this, 'environment.project.uuid'),
-                'environment_name' => data_get($this, 'environment.name'),
+                'environment_uuid' => data_get($this, 'environment.uuid'),
                 'database_uuid' => data_get($this, 'uuid'),
             ]);
         }
@@ -209,7 +302,13 @@ class StandaloneClickhouse extends BaseModel
     protected function internalDbUrl(): Attribute
     {
         return new Attribute(
-            get: fn () => "clickhouse://{$this->clickhouse_admin_user}:{$this->clickhouse_admin_password}@{$this->uuid}:9000/{$this->clickhouse_db}",
+            get: function () {
+                $encodedUser = rawurlencode($this->clickhouse_admin_user);
+                $encodedPass = rawurlencode($this->clickhouse_admin_password);
+                $database = $this->clickhouse_db ?? 'default';
+
+                return "clickhouse://{$encodedUser}:{$encodedPass}@{$this->uuid}:9000/{$database}";
+            },
         );
     }
 
@@ -218,7 +317,15 @@ class StandaloneClickhouse extends BaseModel
         return new Attribute(
             get: function () {
                 if ($this->is_public && $this->public_port) {
-                    return "clickhouse://{$this->clickhouse_admin_user}:{$this->clickhouse_admin_password}@{$this->destination->server->getIp}:{$this->public_port}/{$this->clickhouse_db}";
+                    $serverIp = $this->destination->server->getIp;
+                    if (empty($serverIp)) {
+                        return null;
+                    }
+                    $encodedUser = rawurlencode($this->clickhouse_admin_user);
+                    $encodedPass = rawurlencode($this->clickhouse_admin_password);
+                    $database = $this->clickhouse_db ?? 'default';
+
+                    return "clickhouse://{$encodedUser}:{$encodedPass}@{$serverIp}:{$this->public_port}/{$database}";
                 }
 
                 return null;
@@ -241,14 +348,14 @@ class StandaloneClickhouse extends BaseModel
         return $this->morphTo();
     }
 
-    public function environment_variables(): HasMany
+    public function environment_variables()
     {
-        return $this->hasMany(EnvironmentVariable::class);
+        return $this->morphMany(EnvironmentVariable::class, 'resourceable');
     }
 
-    public function runtime_environment_variables(): HasMany
+    public function runtime_environment_variables()
     {
-        return $this->hasMany(EnvironmentVariable::class);
+        return $this->morphMany(EnvironmentVariable::class, 'resourceable');
     }
 
     public function persistentStorages()
@@ -261,32 +368,8 @@ class StandaloneClickhouse extends BaseModel
         return $this->morphMany(ScheduledDatabaseBackup::class, 'database');
     }
 
-    public function getMetrics(int $mins = 5)
+    public function isBackupSolutionAvailable()
     {
-        $server = $this->destination->server;
-        $container_name = $this->uuid;
-        if ($server->isMetricsEnabled()) {
-            $from = now()->subMinutes($mins)->toIso8601ZuluString();
-            $metrics = instant_remote_process(["docker exec coolify-sentinel sh -c 'curl -H \"Authorization: Bearer {$server->settings->metrics_token}\" http://localhost:8888/api/container/{$container_name}/metrics/history?from=$from'"], $server, false);
-            if (str($metrics)->contains('error')) {
-                $error = json_decode($metrics, true);
-                $error = data_get($error, 'error', 'Something is not okay, are you okay?');
-                if ($error == 'Unauthorized') {
-                    $error = 'Unauthorized, please check your metrics token or restart Sentinel to set a new token.';
-                }
-                throw new \Exception($error);
-            }
-            $metrics = str($metrics)->explode("\n")->skip(1)->all();
-            $parsedCollection = collect($metrics)->flatMap(function ($item) {
-                return collect(explode("\n", trim($item)))->map(function ($line) {
-                    [$time, $cpu_usage_percent, $memory_usage, $memory_usage_percent] = explode(',', trim($line));
-                    $cpu_usage_percent = number_format($cpu_usage_percent, 2);
-
-                    return [(int) $time, (float) $cpu_usage_percent, (int) $memory_usage];
-                });
-            });
-
-            return $parsedCollection->toArray();
-        }
+        return true;
     }
 }

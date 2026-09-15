@@ -2,23 +2,44 @@
 
 namespace App\Models;
 
-use Illuminate\Database\Eloquent\Casts\Attribute;
+use App\Traits\HasSafeStringAttribute;
+use Illuminate\Support\Facades\DB;
+use OpenApi\Attributes as OA;
 
+#[OA\Schema(
+    description: 'Tag model',
+    type: 'object',
+    properties: [
+        new OA\Property(property: 'uuid', type: 'string'),
+        new OA\Property(property: 'name', type: 'string'),
+        new OA\Property(property: 'created_at', type: 'string'),
+        new OA\Property(property: 'updated_at', type: 'string'),
+    ]
+)]
 class Tag extends BaseModel
 {
-    protected $guarded = [];
+    use HasSafeStringAttribute;
 
-    public function name(): Attribute
+    protected $fillable = [
+        'name',
+        'team_id',
+    ];
+
+    protected function customizeName($value)
     {
-        return Attribute::make(
-            get: fn ($value) => strtolower($value),
-            set: fn ($value) => strtolower($value)
-        );
+        return strtolower($value);
     }
 
     public static function ownedByCurrentTeam()
     {
         return Tag::whereTeamId(currentTeam()->id)->orderBy('name');
+    }
+
+    public function deleteIfOrphaned(): void
+    {
+        if (DB::table('taggables')->where('tag_id', $this->id)->doesntExist()) {
+            $this->delete();
+        }
     }
 
     public function applications()

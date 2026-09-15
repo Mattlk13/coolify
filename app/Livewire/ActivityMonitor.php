@@ -2,8 +2,9 @@
 
 namespace App\Livewire;
 
-use App\Enums\ProcessStatus;
+use App\Models\Server;
 use App\Models\User;
+use Livewire\Attributes\Locked;
 use Livewire\Component;
 use Spatie\Activitylog\Models\Activity;
 
@@ -11,46 +12,115 @@ class ActivityMonitor extends Component
 {
     public ?string $header = null;
 
-    public $activityId;
+    #[Locked]
+    public $activityId = null;
 
     public $eventToDispatch = 'activityFinished';
+
+    public $eventData = null;
 
     public $isPollingActive = false;
 
     public bool $fullHeight = false;
 
-    public bool $showWaiting = false;
+    public $activity;
 
-    protected $activity;
+    public bool $showWaiting = true;
 
-    protected $listeners = ['activityMonitor' => 'newMonitorActivity'];
+    public static $eventDispatched = false;
 
-    public function newMonitorActivity($activityId, $eventToDispatch = 'activityFinished')
+    protected $listeners = [
+        'activityMonitor' => 'newMonitorActivity',
+        'processDialogClosed' => 'clearActivity',
+    ];
+
+    public function newMonitorActivity($activityId, $eventToDispatch = 'activityFinished', $eventData = null, $header = null)
     {
+        // Reset event dispatched flag for new activity
+        self::$eventDispatched = false;
+
         $this->activityId = $activityId;
         $this->eventToDispatch = $eventToDispatch;
+        $this->eventData = $eventData;
+
+        // Update header if provided
+        if ($header !== null) {
+            $this->header = $header;
+        }
 
         $this->hydrateActivity();
 
         $this->isPollingActive = true;
     }
 
+    public function clearActivity(): void
+    {
+        $this->activityId = null;
+        $this->activity = null;
+        $this->isPollingActive = false;
+        $this->eventToDispatch = 'activityFinished';
+        $this->eventData = null;
+        self::$eventDispatched = false;
+    }
+
     public function hydrateActivity()
     {
-        $this->activity = Activity::find($this->activityId);
+        if ($this->activityId === null) {
+            $this->activity = null;
+
+            return;
+        }
+
+        $activity = Activity::find($this->activityId);
+
+        if (! $activity) {
+            $this->activity = null;
+
+            return;
+        }
+
+        $currentTeamId = currentTeam()?->id;
+
+        // Check team_id stored directly in activity properties
+        $activityTeamId = data_get($activity, 'properties.team_id');
+        if ($activityTeamId !== null) {
+            if ((int) $activityTeamId !== (int) $currentTeamId) {
+                $this->activity = null;
+
+                return;
+            }
+
+            $this->activity = $activity;
+
+            return;
+        }
+
+        // Fallback: verify ownership via the server that ran the command
+        $serverUuid = data_get($activity, 'properties.server_uuid');
+        if ($serverUuid) {
+            $server = Server::where('uuid', $serverUuid)->first();
+            if ($server && (int) $server->team_id !== (int) $currentTeamId) {
+                $this->activity = null;
+
+                return;
+            }
+
+            if ($server) {
+                $this->activity = $activity;
+
+                return;
+            }
+        }
+
+        // Fail closed: no team_id and no server_uuid means we cannot verify ownership
+        $this->activity = null;
     }
 
     public function polling()
     {
         $this->hydrateActivity();
-        // $this->setStatus(ProcessStatus::IN_PROGRESS);
         $exit_code = data_get($this->activity, 'properties.exitCode');
         if ($exit_code !== null) {
-            // if ($exit_code === 0) {
-            //     // $this->setStatus(ProcessStatus::FINISHED);
-            // } else {
-            //     // $this->setStatus(ProcessStatus::ERROR);
-            // }
             $this->isPollingActive = false;
             if ($exit_code === 0) {
                 if ($this->eventToDispatch !== null) {
@@ -58,25 +128,31 @@ class ActivityMonitor extends Component
                         $causer_id = data_get($this->activity, 'causer_id');
                         $user = User::find($causer_id);
                         if ($user) {
-                            foreach ($user->teams as $team) {
-                                $teamId = $team->id;
-                                $this->eventToDispatch::dispatch($teamId);
+                            $teamId = data_get($this->activity, 'properties.team_id')
+                                ?? $user->currentTeam()?->id
+                                ?? $user->teams->first()?->id;
+                            if ($teamId && ! self::$eventDispatched) {
+                                if (filled($this->eventData)) {
+                                    $this->eventToDispatch::dispatch($teamId, $this->eventData);
+                                } else {
+                                    $this->eventToDispatch::dispatch($teamId);
+                                }
+                                self::$eventDispatched = true;
                             }
                         }
 
                         return;
                     }
-                    $this->dispatch($this->eventToDispatch);
+                    if (! self::$eventDispatched) {
+                        if (filled($this->eventData)) {
+                            $this->dispatch($this->eventToDispatch, $this->eventData);
+                        } else {
+                            $this->dispatch($this->eventToDispatch);
+                        }
+                        self::$eventDispatched = true;
+                    }
                 }
             }
         }
     }
-
-    // protected function setStatus($status)
-    // {
-    //     $this->activity->properties = $this->activity->properties->merge([
-    //         'status' => $status,
-    //     ]);
-    //     $this->activity->save();
-    // }
 }

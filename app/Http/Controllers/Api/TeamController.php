@@ -10,19 +10,9 @@ class TeamController extends Controller
 {
     private function removeSensitiveData($team)
     {
-        $token = auth()->user()->currentAccessToken();
         $team->makeHidden([
             'custom_server_limit',
             'pivot',
-        ]);
-        if ($token->can('view:sensitive')) {
-            return serializeApiResponse($team);
-        }
-        $team->makeHidden([
-            'smtp_username',
-            'smtp_password',
-            'resend_api_key',
-            'telegram_token',
         ]);
 
         return serializeApiResponse($team);
@@ -32,6 +22,7 @@ class TeamController extends Controller
         summary: 'List',
         description: 'Get all teams.',
         path: '/teams',
+        operationId: 'list-teams',
         security: [
             ['bearerAuth' => []],
         ],
@@ -65,7 +56,7 @@ class TeamController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
-        $teams = auth()->user()->teams->sortBy('id');
+        $teams = auth()->user()->teams->where('id', $teamId)->values();
         $teams = $teams->map(function ($team) {
             return $this->removeSensitiveData($team);
         });
@@ -79,6 +70,7 @@ class TeamController extends Controller
         summary: 'Get',
         description: 'Get team by TeamId.',
         path: '/teams/{id}',
+        operationId: 'get-team-by-id',
         security: [
             ['bearerAuth' => []],
         ],
@@ -108,16 +100,18 @@ class TeamController extends Controller
     )]
     public function team_by_id(Request $request)
     {
-        $id = $request->id;
         $teamId = getTeamIdFromToken();
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
-        $teams = auth()->user()->teams;
-        $team = $teams->where('id', $id)->first();
+        if ((int) $request->id !== (int) $teamId) {
+            return response()->json(['message' => 'Team not found.'], 404);
+        }
+        $team = auth()->user()->teams->where('id', $teamId)->first();
         if (is_null($team)) {
             return response()->json(['message' => 'Team not found.'], 404);
         }
+        $this->authorize('view', $team);
         $team = $this->removeSensitiveData($team);
 
         return response()->json(
@@ -129,6 +123,7 @@ class TeamController extends Controller
         summary: 'Members',
         description: 'Get members by TeamId.',
         path: '/teams/{id}/members',
+        operationId: 'get-members-by-team-id',
         security: [
             ['bearerAuth' => []],
         ],
@@ -165,19 +160,23 @@ class TeamController extends Controller
     )]
     public function members_by_id(Request $request)
     {
-        $id = $request->id;
         $teamId = getTeamIdFromToken();
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
-        $teams = auth()->user()->teams;
-        $team = $teams->where('id', $id)->first();
+        if ((int) $request->id !== (int) $teamId) {
+            return response()->json(['message' => 'Team not found.'], 404);
+        }
+        $team = auth()->user()->teams->where('id', $teamId)->first();
         if (is_null($team)) {
             return response()->json(['message' => 'Team not found.'], 404);
         }
+        $this->authorize('view', $team);
         $members = $team->members;
         $members->makeHidden([
             'pivot',
+            'email_change_code',
+            'email_change_code_expires_at',
         ]);
 
         return response()->json(
@@ -187,8 +186,9 @@ class TeamController extends Controller
 
     #[OA\Get(
         summary: 'Authenticated Team',
-        description: 'Get currently authenticated team.',
-        path: '/teams/current',
+        description: 'Get the team bound to the API token.',
+        path: '/team',
+        operationId: 'get-token-team',
         security: [
             ['bearerAuth' => []],
         ],
@@ -196,7 +196,7 @@ class TeamController extends Controller
         responses: [
             new OA\Response(
                 response: 200,
-                description: 'Current Team.',
+                description: 'Team bound to the API token.',
                 content: new OA\JsonContent(ref: '#/components/schemas/Team')),
             new OA\Response(
                 response: 401,
@@ -214,7 +214,10 @@ class TeamController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
-        $team = auth()->user()->currentTeam();
+        $team = auth()->user()->teams->where('id', $teamId)->first();
+        if (is_null($team)) {
+            return response()->json(['message' => 'Team not found.'], 404);
+        }
 
         return response()->json(
             $this->removeSensitiveData($team),
@@ -223,8 +226,9 @@ class TeamController extends Controller
 
     #[OA\Get(
         summary: 'Authenticated Team Members',
-        description: 'Get currently authenticated team members.',
-        path: '/teams/current/members',
+        description: 'Get members of the team bound to the API token.',
+        path: '/team/members',
+        operationId: 'get-token-team-members',
         security: [
             ['bearerAuth' => []],
         ],
@@ -232,7 +236,7 @@ class TeamController extends Controller
         responses: [
             new OA\Response(
                 response: 200,
-                description: 'Currently authenticated team members.',
+                description: 'Members of the team bound to the API token.',
                 content: [
                     new OA\MediaType(
                         mediaType: 'application/json',
@@ -258,9 +262,14 @@ class TeamController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
-        $team = auth()->user()->currentTeam();
+        $team = auth()->user()->teams->where('id', $teamId)->first();
+        if (is_null($team)) {
+            return response()->json(['message' => 'Team not found.'], 404);
+        }
         $team->members->makeHidden([
             'pivot',
+            'email_change_code',
+            'email_change_code_expires_at',
         ]);
 
         return response()->json(

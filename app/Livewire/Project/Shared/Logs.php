@@ -25,6 +25,8 @@ class Logs extends Component
 
     public Collection $containers;
 
+    public array $serverContainers = [];
+
     public $container = [];
 
     public $parameters;
@@ -37,25 +39,76 @@ class Logs extends Component
 
     public $cpu;
 
-    public function loadContainers($server_id)
+    public bool $containersLoaded = false;
+
+    public function getListeners()
+    {
+        $teamId = auth()->user()->currentTeam()->id;
+
+        return [
+            "echo-private:team.{$teamId},ServiceChecked" => '$refresh',
+        ];
+    }
+
+    public function loadAllContainers()
     {
         try {
-            $server = $this->servers->firstWhere('id', $server_id);
-            if (! $server->isFunctional()) {
-                return;
+            foreach ($this->servers as $server) {
+                $this->serverContainers[$server->id] = $this->getContainersForServer($server);
             }
+            $this->containersLoaded = true;
+        } catch (\Exception $e) {
+            $this->containersLoaded = true; // Set to true to stop loading spinner
+
+            return handleError($e, $this);
+        }
+    }
+
+    private function getContainersForServer($server)
+    {
+        if (! $server->isFunctional()) {
+            return [];
+        }
+
+        try {
             if ($server->isSwarm()) {
                 $containers = collect([
                     [
+                        'ID' => $this->resource->uuid,
                         'Names' => $this->resource->uuid.'_'.$this->resource->uuid,
                     ],
                 ]);
-            } else {
-                $containers = getCurrentApplicationContainerStatus($server, $this->resource->id, includePullrequests: true);
+
+                return $containers->toArray();
             }
-            $server->containers = $containers->sort();
+
+            // Docker labels differ by resource type:
+            // applications → coolify.applicationId, services → coolify.serviceId, databases → coolify.databaseId
+            $containers = match (true) {
+                $this->resource instanceof Application => getCurrentApplicationContainerStatus(
+                    $server,
+                    $this->resource->id,
+                    includePullrequests: true
+                ),
+                $this->resource instanceof Service => getCurrentServiceContainerStatus(
+                    $server,
+                    $this->resource->id
+                ),
+                default => getCurrentDatabaseContainerStatus(
+                    $server,
+                    $this->resource->id
+                ),
+            };
+
+            if ($containers && $containers->count() > 0) {
+                return $containers->sort()->toArray();
+            }
+
+            return [];
         } catch (\Exception $e) {
-            return handleError($e, $this);
+            // Log error but don't fail the entire operation
+
+            return [];
         }
     }
 
@@ -64,14 +117,16 @@ class Logs extends Component
         try {
             $this->containers = collect();
             $this->servers = collect();
+            $this->serverContainers = [];
             $this->parameters = get_route_parameters();
             $this->query = request()->query();
             if (data_get($this->parameters, 'application_uuid')) {
                 $this->type = 'application';
-                $this->resource = Application::where('uuid', $this->parameters['application_uuid'])->firstOrFail();
+                $this->resource = Application::ownedByCurrentTeam()->where('uuid', $this->parameters['application_uuid'])->firstOrFail();
                 $this->status = $this->resource->status;
                 if ($this->resource->destination->server->isFunctional()) {
-                    $this->servers = $this->servers->push($this->resource->destination->server);
+                    $server = $this->resource->destination->server;
+                    $this->servers = $this->servers->push($server);
                 }
                 foreach ($this->resource->additional_servers as $server) {
                     if ($server->isFunctional()) {
@@ -87,13 +142,14 @@ class Logs extends Component
                 $this->resource = $resource;
                 $this->status = $this->resource->status;
                 if ($this->resource->destination->server->isFunctional()) {
-                    $this->servers = $this->servers->push($this->resource->destination->server);
+                    $server = $this->resource->destination->server;
+                    $this->servers = $this->servers->push($server);
                 }
                 $this->container = $this->resource->uuid;
                 $this->containers->push($this->container);
             } elseif (data_get($this->parameters, 'service_uuid')) {
                 $this->type = 'service';
-                $this->resource = Service::where('uuid', $this->parameters['service_uuid'])->firstOrFail();
+                $this->resource = Service::ownedByCurrentTeam()->where('uuid', $this->parameters['service_uuid'])->firstOrFail();
                 $this->resource->applications()->get()->each(function ($application) {
                     $this->containers->push(data_get($application, 'name').'-'.data_get($this->resource, 'uuid'));
                 });
@@ -101,7 +157,8 @@ class Logs extends Component
                     $this->containers->push(data_get($database, 'name').'-'.data_get($this->resource, 'uuid'));
                 });
                 if ($this->resource->server->isFunctional()) {
-                    $this->servers = $this->servers->push($this->resource->server);
+                    $server = $this->resource->server;
+                    $this->servers = $this->servers->push($server);
                 }
             }
             $this->containers = $this->containers->sort();
@@ -109,10 +166,7 @@ class Logs extends Component
                 $this->containers = $this->containers->filter(function ($container) {
                     return str_contains($container, $this->query['pull_request_id']);
                 });
-                ray($this->containers);
-
             }
-
         } catch (\Exception $e) {
             return handleError($e, $this);
         }

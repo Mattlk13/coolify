@@ -7,21 +7,34 @@ use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Team;
+use App\Services\ConfigurationRepository;
+use App\Support\ValidationPatterns;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Support\Collection;
+use Livewire\Attributes\Url;
 use Livewire\Component;
 
 class Index extends Component
 {
-    protected $listeners = ['refreshBoardingIndex' => 'validateServer'];
+    use AuthorizesRequests;
 
+    protected $listeners = [
+        'refreshBoardingIndex' => 'validateServer',
+        'prerequisitesInstalled' => 'handlePrerequisitesInstalled',
+    ];
+
+    #[Url(as: 'step', history: true)]
     public string $currentState = 'welcome';
 
+    #[Url(keep: true)]
     public ?string $selectedServerType = null;
 
     public ?Collection $privateKeys = null;
 
+    #[Url(keep: true)]
     public ?int $selectedExistingPrivateKey = null;
 
+    #[Url(keep: true)]
     public ?string $privateKeyType = null;
 
     public ?string $privateKey = null;
@@ -36,6 +49,7 @@ class Index extends Component
 
     public ?Collection $servers = null;
 
+    #[Url(keep: true)]
     public ?int $selectedExistingServer = null;
 
     public ?string $remoteServerName = null;
@@ -56,6 +70,7 @@ class Index extends Component
 
     public Collection $projects;
 
+    #[Url(keep: true)]
     public ?int $selectedProject = null;
 
     public ?Project $createdProject = null;
@@ -66,45 +81,84 @@ class Index extends Component
 
     public bool $serverReachable = true;
 
+    public ?string $minDockerVersion = null;
+
+    public int $prerequisiteInstallAttempts = 0;
+
+    public int $maxPrerequisiteInstallAttempts = 3;
+
     public function mount()
     {
         if (auth()->user()?->isMember() && auth()->user()->currentTeam()->show_boarding === true) {
             return redirect()->route('dashboard');
         }
+
+        $this->minDockerVersion = str(config('constants.docker.minimum_required_version'))->before('.');
         $this->privateKeyName = generate_random_name();
         $this->remoteServerName = generate_random_name();
-        if (isDev()) {
-            $this->privateKey = '-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevAAAAJi/QySHv0Mk
-hwAAAAtzc2gtZWQyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevA
-AAAECBQw4jg1WRT2IGHMncCiZhURCts2s24HoDS0thHnnRKVuGmoeGq/pojrsyP1pszcNV
-uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
------END OPENSSH PRIVATE KEY-----';
-            $this->privateKeyDescription = 'Created by Coolify';
-            $this->remoteServerDescription = 'Created by Coolify';
-            $this->remoteServerHost = 'coolify-testing-host';
-        }
-        // if ($this->currentState === 'create-project') {
-        //     $this->getProjects();
-        // }
-        // if ($this->currentState === 'create-resource') {
-        //     $this->selectExistingServer();
-        //     $this->selectExistingProject();
-        // }
-        // if ($this->currentState === 'private-key') {
-        //     $this->setServerType('remote');
-        // }
-        // if ($this->currentState === 'create-server') {
-        //     $this->selectExistingPrivateKey();
-        // }
-        // if ($this->currentState === 'validate-server') {
-        //     $this->selectExistingServer();
-        // }
-        // if ($this->currentState === 'select-existing-server') {
-        //     $this->selectExistingServer();
-        // }
 
+        // Initialize collections to avoid null errors
+        if ($this->privateKeys === null) {
+            $this->privateKeys = collect();
+        }
+        if ($this->servers === null) {
+            $this->servers = collect();
+        }
+        if (! isset($this->projects)) {
+            $this->projects = collect();
+        }
+
+        // Restore state when coming from URL with query params
+        if ($this->selectedServerType === 'localhost' && $this->selectedExistingServer === 0) {
+            $this->createdServer = Server::find(0);
+            if ($this->createdServer) {
+                $this->serverPublicKey = $this->createdServer->privateKey->getPublicKey();
+            }
+        }
+
+        if ($this->selectedServerType === 'remote') {
+            if ($this->privateKeys->isEmpty()) {
+                $this->privateKeys = PrivateKey::ownedAndOnlySShKeys(['name'])->where('id', '!=', 0)->get();
+            }
+            if ($this->servers->isEmpty()) {
+                $this->servers = Server::ownedByCurrentTeam(['name'])->where('id', '!=', 0)->get();
+            }
+
+            if ($this->selectedExistingServer) {
+                $this->createdServer = Server::ownedByCurrentTeam()->find($this->selectedExistingServer);
+                if ($this->createdServer) {
+                    $this->serverPublicKey = $this->createdServer->privateKey->getPublicKey();
+                    $this->updateServerDetails();
+                }
+            }
+
+            if ($this->selectedExistingPrivateKey) {
+                $this->createdPrivateKey = PrivateKey::where('team_id', currentTeam()->id)
+                    ->where('id', $this->selectedExistingPrivateKey)
+                    ->first();
+                if ($this->createdPrivateKey) {
+                    $this->privateKey = $this->createdPrivateKey->private_key;
+                    $this->publicKey = $this->createdPrivateKey->getPublicKey();
+                }
+            }
+
+            // Auto-regenerate key pair for "Generate with Coolify" mode on page refresh
+            if ($this->privateKeyType === 'create' && empty($this->privateKey)) {
+                $this->createNewPrivateKey();
+            }
+        }
+
+        if ($this->selectedProject) {
+            $this->createdProject = Project::ownedByCurrentTeam()->find($this->selectedProject);
+            if (! $this->createdProject) {
+                $this->projects = Project::ownedByCurrentTeam(['name'])->get();
+            }
+        }
+
+        // Load projects when on create-project state (for page refresh)
+        if ($this->currentState === 'create-project' && $this->projects->isEmpty()) {
+            $this->projects = Project::ownedByCurrentTeam(['name'])->get();
+        }
     }
 
     public function explanation()
@@ -122,6 +176,9 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
 
     public function skipBoarding()
     {
+        if (auth()->user()?->isMember()) {
+            return redirect()->route('dashboard');
+        }
         Team::find(currentTeam()->id)->update([
             'show_boarding' => false,
         ]);
@@ -139,63 +196,59 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
             if (! $this->createdServer) {
                 return $this->dispatch('error', 'Localhost server is not found. Something went wrong during installation. Please try to reinstall or contact support.');
             }
-            $this->serverPublicKey = $this->createdServer->privateKey->publicKey();
+            $this->serverPublicKey = $this->createdServer->privateKey->getPublicKey();
 
             return $this->validateServer('localhost');
         } elseif ($this->selectedServerType === 'remote') {
-            if (isDev()) {
-                $this->privateKeys = PrivateKey::ownedByCurrentTeam(['name'])->get();
-            } else {
-                $this->privateKeys = PrivateKey::ownedByCurrentTeam(['name'])->where('id', '!=', 0)->get();
-            }
+            $this->privateKeys = PrivateKey::ownedAndOnlySShKeys(['name'])->where('id', '!=', 0)->get();
+            // Auto-select first key if available for better UX
             if ($this->privateKeys->count() > 0) {
                 $this->selectedExistingPrivateKey = $this->privateKeys->first()->id;
             }
-            $this->servers = Server::ownedByCurrentTeam(['name'])->where('id', '!=', 0)->get();
-            if ($this->servers->count() > 0) {
-                $this->selectedExistingServer = $this->servers->first()->id;
-                $this->currentState = 'select-existing-server';
-
-                return;
-            }
+            // Onboarding always creates new servers, skip existing server selection
             $this->currentState = 'private-key';
         }
     }
 
-    public function selectExistingServer()
+    private function updateServerDetails()
     {
-        $this->createdServer = Server::find($this->selectedExistingServer);
-        if (! $this->createdServer) {
-            $this->dispatch('error', 'Server is not found.');
-            $this->currentState = 'private-key';
-
-            return;
+        if ($this->createdServer) {
+            $this->remoteServerPort = $this->createdServer->port;
+            $this->remoteServerUser = $this->createdServer->user;
         }
-        $this->selectedExistingPrivateKey = $this->createdServer->privateKey->id;
-        $this->serverPublicKey = $this->createdServer->privateKey->publicKey();
-        $this->currentState = 'validate-server';
+    }
+
+    protected function rules(): array
+    {
+        return [
+            'remoteServerName' => 'required|string',
+            'remoteServerHost' => 'required|string',
+            'remoteServerPort' => 'required|integer|min:1|max:65535',
+            'remoteServerUser' => ValidationPatterns::serverUsernameRules(),
+        ];
+    }
+
+    protected function messages(): array
+    {
+        return [
+            ...ValidationPatterns::serverUsernameMessages('remoteServerUser', 'SSH User'),
+        ];
     }
 
     public function getProxyType()
     {
-        // Set Default Proxy Type
         $this->selectProxy(ProxyTypes::TRAEFIK->value);
-        // $proxyTypeSet = $this->createdServer->proxy->type;
-        // if (!$proxyTypeSet) {
-        //     $this->currentState = 'select-proxy';
-        //     return;
-        // }
         $this->getProjects();
     }
 
     public function selectExistingPrivateKey()
     {
         if (is_null($this->selectedExistingPrivateKey)) {
-            $this->restartBoarding();
+            $this->dispatch('error', 'Please select a private key.');
 
             return;
         }
-        $this->createdPrivateKey = PrivateKey::find($this->selectedExistingPrivateKey);
+        $this->createdPrivateKey = PrivateKey::where('team_id', currentTeam()->id)->where('id', $this->selectedExistingPrivateKey)->first();
         $this->privateKey = $this->createdPrivateKey->private_key;
         $this->currentState = 'create-server';
     }
@@ -212,6 +265,9 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         $this->privateKeyType = $type;
         if ($type === 'create') {
             $this->createNewPrivateKey();
+        } else {
+            $this->privateKey = null;
+            $this->publicKey = null;
         }
         $this->currentState = 'create-private-key';
     }
@@ -219,31 +275,45 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
     public function savePrivateKey()
     {
         $this->validate([
-            'privateKeyName' => 'required',
-            'privateKey' => 'required',
+            'privateKeyName' => 'required|string|max:255',
+            'privateKeyDescription' => 'nullable|string|max:255',
+            'privateKey' => 'required|string',
         ]);
-        $this->createdPrivateKey = PrivateKey::create([
-            'name' => $this->privateKeyName,
-            'description' => $this->privateKeyDescription,
-            'private_key' => $this->privateKey,
-            'team_id' => currentTeam()->id,
-        ]);
-        $this->createdPrivateKey->save();
-        $this->currentState = 'create-server';
+
+        try {
+            $this->authorize('create', PrivateKey::class);
+            $privateKey = PrivateKey::createAndStore([
+                'name' => $this->privateKeyName,
+                'description' => $this->privateKeyDescription,
+                'private_key' => $this->privateKey,
+                'team_id' => currentTeam()->id,
+            ]);
+
+            $this->createdPrivateKey = $privateKey;
+            $this->currentState = 'create-server';
+        } catch (\Exception $e) {
+            $this->addError('privateKey', 'Failed to save private key: '.$e->getMessage());
+        }
     }
 
     public function saveServer()
     {
-        $this->validate([
-            'remoteServerName' => 'required',
-            'remoteServerHost' => 'required',
-            'remoteServerPort' => 'required|integer',
-            'remoteServerUser' => 'required',
-        ]);
+        $this->validate();
+
+        try {
+            $this->authorize('create', Server::class);
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
+
         $this->privateKey = formatPrivateKey($this->privateKey);
         $foundServer = Server::whereIp($this->remoteServerHost)->first();
         if ($foundServer) {
-            return $this->dispatch('error', 'IP address is already in use by another team.');
+            if ($foundServer->team_id === currentTeam()->id) {
+                return $this->dispatch('error', 'A server with this IP/Domain already exists in your team.');
+            }
+
+            return $this->dispatch('error', 'A server with this IP/Domain is already in use by another team.');
         }
         $this->createdServer = Server::create([
             'name' => $this->remoteServerName,
@@ -269,7 +339,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
     public function validateServer()
     {
         try {
-            config()->set('coolify.mux_enabled', false);
+            $this->disableSshMux();
 
             // EC2 does not have `uptime` command, lol
             instant_remote_process(['ls /'], $this->createdServer, true);
@@ -277,13 +347,72 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
             $this->createdServer->settings()->update([
                 'is_reachable' => true,
             ]);
+            $this->serverReachable = true;
         } catch (\Throwable $e) {
             $this->serverReachable = false;
-            $this->createdServer->delete();
+            $this->createdServer->settings()->update([
+                'is_reachable' => false,
+            ]);
 
             return handleError(error: $e, livewire: $this);
         }
 
+        try {
+            // Check prerequisites
+            $validationResult = $this->createdServer->validatePrerequisites();
+            if (! $validationResult['success']) {
+                // Check if we've exceeded max attempts
+                if ($this->prerequisiteInstallAttempts >= $this->maxPrerequisiteInstallAttempts) {
+                    $missingCommands = implode(', ', $validationResult['missing']);
+                    throw new \Exception("Prerequisites ({$missingCommands}) could not be installed after {$this->maxPrerequisiteInstallAttempts} attempts. Please install them manually.");
+                }
+
+                // Start async installation and wait for completion via ActivityMonitor
+                $activity = $this->createdServer->installPrerequisites();
+                $this->prerequisiteInstallAttempts++;
+                $this->dispatch('activityMonitor', $activity->id, 'prerequisitesInstalled');
+
+                // Return early - handlePrerequisitesInstalled() will be called when installation completes
+                return;
+            }
+
+            // Prerequisites are already installed, continue with validation
+            $this->continueValidation();
+        } catch (\Throwable $e) {
+            return handleError(error: $e, livewire: $this);
+        }
+    }
+
+    public function handlePrerequisitesInstalled()
+    {
+        try {
+            // Revalidate prerequisites after installation completes
+            $validationResult = $this->createdServer->validatePrerequisites();
+            if (! $validationResult['success']) {
+                // Installation completed but prerequisites still missing - retry
+                $missingCommands = implode(', ', $validationResult['missing']);
+
+                if ($this->prerequisiteInstallAttempts >= $this->maxPrerequisiteInstallAttempts) {
+                    throw new \Exception("Prerequisites ({$missingCommands}) could not be installed after {$this->maxPrerequisiteInstallAttempts} attempts. Please install them manually.");
+                }
+
+                // Try again
+                $activity = $this->createdServer->installPrerequisites();
+                $this->prerequisiteInstallAttempts++;
+                $this->dispatch('activityMonitor', $activity->id, 'prerequisitesInstalled');
+
+                return;
+            }
+
+            // Prerequisites validated successfully - continue with Docker validation
+            $this->continueValidation();
+        } catch (\Throwable $e) {
+            return handleError(error: $e, livewire: $this);
+        }
+    }
+
+    private function continueValidation()
+    {
         try {
             $dockerVersion = instant_remote_process(["docker version|head -2|grep -i version| awk '{print $2}'"], $this->createdServer, true);
             $dockerVersion = checkMinimumDockerEngineVersion($dockerVersion);
@@ -296,6 +425,10 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
             ]);
             $this->getProxyType();
         } catch (\Throwable $e) {
+            $this->createdServer->settings()->update([
+                'is_usable' => false,
+            ]);
+
             return handleError(error: $e, livewire: $this);
         }
     }
@@ -307,6 +440,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         }
         $this->createdServer->proxy->type = $proxyType;
         $this->createdServer->proxy->status = 'exited';
+        $this->createdServer->proxy->last_saved_settings = null;
+        $this->createdServer->proxy->last_applied_settings = null;
         $this->createdServer->save();
         $this->getProjects();
     }
@@ -322,7 +457,10 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
 
     public function selectExistingProject()
     {
-        $this->createdProject = Project::find($this->selectedProject);
+        $this->createdProject = Project::ownedByCurrentTeam()->find($this->selectedProject);
+        if (! $this->createdProject) {
+            return $this->dispatch('error', 'Project not found.');
+        }
         $this->currentState = 'create-resource';
     }
 
@@ -331,6 +469,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         $this->createdProject = Project::create([
             'name' => 'My first project',
             'team_id' => currentTeam()->id,
+            'uuid' => new_public_id(),
         ]);
         $this->currentState = 'create-resource';
     }
@@ -343,10 +482,25 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
             'project.resource.create',
             [
                 'project_uuid' => $this->createdProject->uuid,
-                'environment_name' => 'production',
+                'environment_uuid' => $this->createdProject->environments->first()->uuid,
                 'server' => $this->createdServer->id,
             ]
         );
+    }
+
+    public function saveAndValidateServer()
+    {
+        $this->validate(array_intersect_key($this->rules(), array_flip([
+            'remoteServerPort',
+            'remoteServerUser',
+        ])));
+
+        $this->createdServer->update([
+            'port' => $this->remoteServerPort,
+            'user' => $this->remoteServerUser,
+            'timezone' => 'UTC',
+        ]);
+        $this->validateServer();
     }
 
     private function createNewPrivateKey()
@@ -354,6 +508,12 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         $this->privateKeyName = generate_random_name();
         $this->privateKeyDescription = 'Created by Coolify';
         ['private' => $this->privateKey, 'public' => $this->publicKey] = generateSSHKey();
+    }
+
+    private function disableSshMux(): void
+    {
+        $configRepository = app(ConfigurationRepository::class);
+        $configRepository->disableSshMux();
     }
 
     public function render()

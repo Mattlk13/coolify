@@ -1,37 +1,39 @@
-<div>
-    <form class="flex flex-col gap-2 pb-6" wire:submit='submit'>
-        <div class="flex items-start gap-2">
-            <div class="pb-4">
-                <h1>Storage Details</h1>
-                <div class="subtitle">{{ $storage->name }}</div>
-                @if ($storage->is_usable)
-                    <div>Usable</div>
+<form wire:submit="submit" class="application-settings-form">
+    <x-unsaved-bar action="submit" />
+
+    <x-application.settings-section title="General"
+        description="S3-compatible destination used by database and volume backups.">
+        <x-slot:actions>
+            @can('validateConnection', $storage)
+                <x-forms.button type="button" wire:click="testConnection">
+                    <x-reicon name="check-circle" class="size-3.5" />
+                    Validate connection
+                </x-forms.button>
+            @endcan
+        </x-slot:actions>
+
+        <div class="grid gap-4 lg:grid-cols-2">
+            <x-forms.input canGate="update" :canResource="$storage" label="Name" id="name" />
+            <x-forms.input canGate="update" :canResource="$storage" label="Description" id="description" />
+            <div class="lg:col-span-2">
+                @can('update', $storage)
+                    <x-forms.domain-input id="endpointParts" errorId="endpoint" host-label="Host"
+                        host-placeholder="minio.internal or 192.168.1.50" />
                 @else
-                    <div class="text-red-500">Not Usable</div>
-                @endif
+                    <x-forms.input label="Endpoint" :value="$endpoint" disabled />
+                @endcan
             </div>
-            <x-forms.button type="submit">
-                Save
-            </x-forms.button>
-            <x-forms.button wire:click="test_s3_connection">
-                Validate Connection
-            </x-forms.button>
-            <x-modal-confirmation isErrorButton buttonTitle="Delete">
-                This storage will be deleted. It is not reversible. Your data won't be touched!<br>Please think again.
-            </x-modal-confirmation>
+            <x-forms.input canGate="update" :canResource="$storage" required label="Bucket" id="bucket" />
+            <x-forms.input canGate="update" :canResource="$storage" required label="Region" id="region" />
+            @if ($isPasswordHiddenForMember)
+                <x-forms.input label="Access key" disabled value="Hidden (only admins can view)" />
+                <x-forms.input label="Secret key" disabled value="Hidden (only admins can view)" />
+            @else
+                <x-forms.input canGate="update" :canResource="$storage" required type="password"
+                    label="Access key" id="key" />
+                <x-forms.input canGate="update" :canResource="$storage" required type="password"
+                    label="Secret key" id="secret" />
+            @endif
         </div>
-        <div class="flex gap-2">
-            <x-forms.input label="Name" id="storage.name" />
-            <x-forms.input label="Description" id="storage.description" />
-        </div>
-        <div class="flex gap-2">
-            <x-forms.input required label="Endpoint" id="storage.endpoint" />
-            <x-forms.input required label="Bucket" id="storage.bucket" />
-            <x-forms.input required label="Region" id="storage.region" />
-        </div>
-        <div class="flex gap-2">
-            <x-forms.input required type="password" label="Access Key" id="storage.key" />
-            <x-forms.input required type="password" label="Secret Key" id="storage.secret" />
-        </div>
-    </form>
-</div>
+    </x-application.settings-section>
+</form>

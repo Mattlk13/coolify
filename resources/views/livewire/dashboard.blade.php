@@ -1,171 +1,205 @@
-<div>
+<div class="application-settings-form w-full">
     <x-slot:title>
         Dashboard | Coolify
     </x-slot>
+
     @if (session('error'))
-        <span x-data x-init="$wire.emit('error', '{{ session('error') }}')" />
-    @endif
-    <h1>Dashboard</h1>
-    <div class="subtitle">Your self-hosted infrastructure.</div>
-    @if (request()->query->get('success'))
-        <div class="items-center justify-center mb-10 font-bold rounded alert alert-success">
-            <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 stroke-current shrink-0" fill="none"
-                viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                    d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            Your subscription has been activated! Welcome onboard! <br>It could take a few seconds before your
-            subscription is activated.<br> Please be patient.
-        </div>
-    @endif
-    <h3 class="pb-4">Projects</h3>
-    @if ($projects->count() > 0)
-        <div class="grid grid-cols-1 gap-2 xl:grid-cols-2">
-            @foreach ($projects as $project)
-                <div class="gap-2 border border-transparent cursor-pointer box group"
-                    onclick="gotoProject('{{ $project->uuid }}','{{ $project->default_environment() }}')">
-                    <div class="flex flex-1 mx-6">
-                        <div class="flex flex-col justify-center flex-1">
-                            <div class="box-title">{{ $project->name }}</div>
-                            <div class="box-description">
-                                {{ $project->description }}</div>
-                        </div>
-                        <div class="flex items-center justify-center gap-2 text-xs font-bold ">
-                            <a class="hover:underline"
-                                href="{{ route('project.resource.create', ['project_uuid' => data_get($project, 'uuid'), 'environment_name' => data_get($project, 'environments.0.name', 'production')]) }}">
-                                <span class="p-2 font-bold">+
-                                    Add Resource</span>
-                            </a>
-                            <a class="hover:underline"
-                                href="{{ route('project.edit', ['project_uuid' => data_get($project, 'uuid')]) }}">
-                                Settings
-                            </a>
-                        </div>
-                    </div>
-                </div>
-            @endforeach
-        </div>
-    @else
-        <div class="flex flex-col gap-1">
-            <div class='font-bold dark:text-warning'>No projects found.</div>
-            <div class="flex items-center gap-1">
-                <x-modal-input buttonTitle="Add" title="New Project">
-                    <livewire:project.add-empty />
-                </x-modal-input> your first project or
-                go to the <a class="underline dark:text-white" href="{{ route('onboarding') }}">onboarding</a> page.
-            </div>
-        </div>
+        <span x-data x-init="$wire.dispatch('error', @js(session('error')))" />
     @endif
 
-    <h3 class="py-4">Servers</h3>
-    @if ($servers->count() > 0)
-        <div class="grid grid-cols-1 gap-2 xl:grid-cols-2">
-            @foreach ($servers as $server)
-                <a href="{{ route('server.show', ['server_uuid' => data_get($server, 'uuid')]) }}"
-                    @class([
-                        'gap-2 border cursor-pointer box group',
-                        'border-transparent' => $server->settings->is_reachable,
-                        'border-red-500' => !$server->settings->is_reachable,
-                    ])>
-                    <div class="flex flex-col justify-center mx-6">
-                        <div class="box-title">
-                            {{ $server->name }}
-                        </div>
-                        <div class="box-description">
-                            {{ $server->description }}</div>
-                        <div class="flex gap-1 text-xs text-error">
-                            @if (!$server->settings->is_reachable)
-                                Not reachable
-                            @endif
-                            @if (!$server->settings->is_reachable && !$server->settings->is_usable)
-                                &
-                            @endif
-                            @if (!$server->settings->is_usable)
-                                Not usable by Coolify
-                            @endif
-                        </div>
-                    </div>
-                    <div class="flex-1"></div>
-                </a>
-            @endforeach
-        </div>
-    @else
-        @if ($private_keys->count() === 0)
-            <div class="flex flex-col gap-1">
-                <div class='font-bold dark:text-warning'>No private keys found.</div>
-                <div class="flex items-center gap-1">Before you can add your server, first <x-modal-input
-                        buttonTitle="add" title="New Private Key">
-                        <livewire:security.private-key.create from="server" />
-                    </x-modal-input> a private key
-                    or
-                    go to the <a class="underline dark:text-white" href="{{ route('onboarding') }}">onboarding</a>
-                    page.
-                </div>
-            </div>
-        @else
-            <div class="flex flex-col gap-1">
-                <div class='font-bold dark:text-warning'>No servers found.</div>
-                <div class="flex items-center gap-1">
-                    <x-modal-input buttonTitle="Add" title="New Server" :closeOutside="false">
-                        <livewire:server.create />
-                    </x-modal-input> your first server
-                    or
-                    go to the <a class="underline dark:text-white" href="{{ route('onboarding') }}">onboarding</a>
-                    page.
-                </div>
-            </div>
-        @endif
-    @endif
-    @if ($servers->count() > 0 && $projects->count() > 0)
-        <div class="flex items-center gap-2">
-            <h3 class="py-4">Deployments</h3>
-            @if (count($deployments_per_server) > 0)
-                <x-loading />
-            @endif
-            <x-modal-confirmation isErrorButton action="cleanup_queue" buttonTitle="Cleanup Queues">
-                This will clean up the deployment queue. <br>Please think again.
-            </x-modal-confirmation>
-        </div>
-        <div wire:poll.3000ms="get_deployments" class="grid grid-cols-1">
-            @forelse ($deployments_per_server as $server_name => $deployments)
-                <h4 class="py-4">{{ $server_name }}</h4>
-                <div class="grid grid-cols-1 gap-2 lg:grid-cols-3">
-                    @foreach ($deployments as $deployment)
-                        <a href="{{ data_get($deployment, 'deployment_url') }}" @class([
-                            'gap-2 cursor-pointer box group border-l-2 border-dotted',
-                            'dark:border-coolgray-300' => data_get($deployment, 'status') === 'queued',
-                            'border-yellow-500' => data_get($deployment, 'status') === 'in_progress',
-                        ])>
-                            <div class="flex flex-col justify-center mx-6">
-                                <div class="box-title">
-                                    {{ data_get($deployment, 'application_name') }}
+    @php
+        $dashboardItemLimit = 8;
+        $dashboardProjects = $projects->sortBy('name', SORT_NATURAL)->take($dashboardItemLimit);
+        $dashboardServers = $servers->sortBy('name', SORT_NATURAL)->take($dashboardItemLimit);
+    @endphp
+
+    <div class="flex min-w-0 flex-col gap-8">
+        <livewire:dashboard.active-deployments />
+
+        <section class="mb-0! min-w-0">
+            <x-section-heading title="Projects" subtitle="Your deployment workspaces"
+                :href="route('project.index')" />
+
+            @if ($dashboardProjects->isEmpty())
+                <x-empty title="No projects yet"
+                    description="Use New to create your first deployment workspace."
+                    icon-name="projects" size="sm" />
+            @else
+                <div class="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    @foreach ($dashboardProjects as $project)
+                        @php
+                            $firstEnvironment = $project->environments->first();
+                            $resourceCount = collect([
+                                $project->applications_count,
+                                $project->services_count,
+                                $project->postgresqls_count,
+                                $project->redis_count,
+                                $project->keydbs_count,
+                                $project->dragonflies_count,
+                                $project->clickhouses_count,
+                                $project->mongodbs_count,
+                                $project->mysqls_count,
+                                $project->mariadbs_count,
+                            ])->sum();
+                        @endphp
+
+                        <article
+                            class="group relative flex min-h-28 min-w-0 flex-col rounded-xl border border-neutral-200 bg-white p-3 shadow-sm transition-all hover:-translate-y-px hover:border-neutral-300 hover:shadow-md dark:border-white/[0.08] dark:bg-white/[0.05] dark:hover:border-white/[0.14]">
+                            <a href="{{ $project->navigateTo() }}" {{ wireNavigate() }}
+                                class="absolute inset-0 rounded-xl"
+                                aria-label="Open {{ $project->name }}"></a>
+
+                            <div class="flex min-w-0 items-start gap-3">
+                                <div
+                                    class="flex size-8 shrink-0 items-center justify-center rounded-lg border border-neutral-200 bg-neutral-50 text-neutral-500 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-fg-dim">
+                                    @if ($project->icon_path)
+                                        <img src="{{ project_icon_url($project) }}"
+                                            alt="{{ $project->name }} icon"
+                                            class="h-full w-full rounded-lg object-cover">
+                                    @else
+                                        <x-reicon name="projects" class="size-4" />
+                                    @endif
                                 </div>
-                                @if (data_get($deployment, 'pull_request_id') !== 0)
-                                    <div class="box-description">
-                                        PR #{{ data_get($deployment, 'pull_request_id') }}
-                                    </div>
-                                @endif
-                                <div class="box-description">
-                                    {{ str(data_get($deployment, 'status'))->headline() }}
+                                <div class="min-w-0 flex-1">
+                                    <h3
+                                        class="truncate text-[13px]! leading-4! font-semibold! text-black dark:text-fg">
+                                        {{ $project->name }}
+                                    </h3>
+                                    <p class="mt-0.5 truncate text-[11px] text-neutral-500 dark:text-fg-faint">
+                                        {{ $project->description }}
+                                    </p>
                                 </div>
                             </div>
-                            <div class="flex-1"></div>
+
+                            <div class="mt-auto flex items-center justify-between gap-3 pt-4">
+                                <p class="min-w-0 truncate text-[11px] text-neutral-500 dark:text-fg-dim">
+                                    {{ $project->environments->count() }}
+                                    {{ str('env')->plural($project->environments->count()) }}
+                                    <span class="px-1 text-neutral-300 dark:text-white/15">·</span>
+                                    {{ $resourceCount }} {{ str('resource')->plural($resourceCount) }}
+                                </p>
+
+                                <div class="relative z-10 flex shrink-0 items-center gap-0.5">
+                                    @if ($firstEnvironment)
+                                        @can('createAnyResource')
+                                            <a href="{{ route('project.resource.create', [
+                                                'project_uuid' => $project->uuid,
+                                                'environment_uuid' => $firstEnvironment->uuid,
+                                            ]) }}"
+                                                {{ wireNavigate() }}
+                                                class="flex size-6.5 items-center justify-center rounded-md text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-black dark:text-fg-faint dark:hover:bg-white/[0.06] dark:hover:text-fg"
+                                                title="Add resource"
+                                                aria-label="Add resource to {{ $project->name }}">
+                                                <x-reicon name="plus" class="size-3" />
+                                            </a>
+                                        @endcan
+                                    @endif
+                                    @can('update', $project)
+                                        <a href="{{ route('project.edit', ['project_uuid' => $project->uuid]) }}"
+                                            {{ wireNavigate() }}
+                                            class="flex size-6.5 items-center justify-center rounded-md text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-black dark:text-fg-faint dark:hover:bg-white/[0.06] dark:hover:text-fg"
+                                            title="Project settings"
+                                            aria-label="Open settings for {{ $project->name }}">
+                                            <x-reicon name="settings" class="size-3" />
+                                        </a>
+                                    @endcan
+                                </div>
+                            </div>
+                        </article>
+                    @endforeach
+                </div>
+            @endif
+        </section>
+
+        <section class="mb-0! min-w-0">
+            <x-section-heading title="Servers" subtitle="Infrastructure available for deployments"
+                :href="route('server.index')" />
+
+            @if ($dashboardServers->isEmpty())
+                @if ($privateKeys->isEmpty())
+                    <x-empty title="A private key is required"
+                        description="Add an SSH private key before connecting your first server."
+                        icon-name="keys" size="sm">
+                        @can('create', App\Models\PrivateKey::class)
+                            <x-slot:contents>
+                                <a href="{{ route('security.private-key.index') }}" {{ wireNavigate() }}
+                                    class="button button-highlighted">
+                                    <x-reicon name="plus" class="size-3.5" />
+                                    Add private key
+                                </a>
+                            </x-slot:contents>
+                        @endcan
+                    </x-empty>
+                @else
+                    <x-empty title="No servers yet"
+                        description="Connect infrastructure for your deployments."
+                        icon-name="servers" size="sm">
+                        @can('createAnyResource')
+                            <x-slot:contents>
+                                <a href="{{ route('server.create') }}" {{ wireNavigate() }}
+                                    class="button button-highlighted">
+                                    <x-reicon name="plus" class="size-3.5" />
+                                    New server
+                                </a>
+                            </x-slot:contents>
+                        @endcan
+                    </x-empty>
+                @endif
+            @else
+                <div class="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    @foreach ($dashboardServers as $server)
+                        @php
+                            $proxyNeedsAttention = $server->proxySet() && ($server->proxy->status !== 'running' || $server->hasCurrentTraefikOutdatedInfo());
+                            $sentinelNeedsAttention = $server->isSentinelEnabled() && ! $server->isSentinelLive();
+
+                            [$serverStatus, $serverStatusType] = match (true) {
+                                $server->settings->force_disabled => ['Disabled', 'error'],
+                                ! $server->settings->is_reachable && ! $server->settings->is_usable => ['Unavailable', 'error'],
+                                ! $server->settings->is_reachable => ['Unreachable', 'error'],
+                                ! $server->settings->is_usable => ['Not ready', 'warning'],
+                                $proxyNeedsAttention || $sentinelNeedsAttention => ['Attention required', 'warning'],
+                                default => ['Ready', 'success'],
+                            };
+                        @endphp
+
+                        <a href="{{ route('server.show', ['server_uuid' => $server->uuid]) }}"
+                            {{ wireNavigate() }} aria-label="Open {{ $server->name }}"
+                            class="group relative flex min-h-28 min-w-0 flex-col rounded-xl border border-neutral-200 bg-white p-3 shadow-sm transition-all hover:-translate-y-px hover:border-neutral-300 hover:shadow-md dark:border-white/[0.08] dark:bg-white/[0.05] dark:hover:border-white/[0.14]">
+                            @if ($server->isMetricsEnabled())
+                                <livewire:dashboard.server-metrics-chart :server="$server"
+                                    :key="'dashboard-server-metrics-'.$server->uuid" />
+                            @endif
+
+                            <div class="relative z-10 flex min-w-0 items-start gap-3">
+                                <div
+                                    class="flex size-8 shrink-0 items-center justify-center rounded-lg border border-neutral-200 bg-neutral-50 text-neutral-500 dark:border-white/[0.1] dark:bg-white/[0.04] dark:text-fg-dim">
+                                    <x-reicon name="servers" class="size-4" />
+                                </div>
+                                <div class="min-w-0 flex-1">
+                                    <h3
+                                        class="truncate text-[13px]! leading-4! font-semibold! text-black dark:text-fg">
+                                        {{ $server->name }}
+                                    </h3>
+                                    <p class="mt-0.5 truncate text-[11px] text-neutral-500 dark:text-fg-faint">
+                                        {{ $server->description }}
+                                    </p>
+                                </div>
+                                @if ($serverStatusType !== 'success')
+                                    <span data-tooltip="{{ $serverStatus }}"
+                                        aria-label="Server status: {{ $serverStatus }}"
+                                        @class([
+                                            'flex size-6 shrink-0 items-center justify-center rounded-md',
+                                            'text-orange-500 dark:text-warning' => $serverStatusType === 'warning',
+                                            'text-red-500 dark:text-red-400' => $serverStatusType === 'error',
+                                        ])>
+                                        <x-reicon name="alert-triangle" class="size-4" />
+                                    </span>
+                                @endif
+                            </div>
                         </a>
                     @endforeach
                 </div>
-            @empty
-                <div>No deployments running.</div>
-            @endforelse
-        </div>
-    @endif
-
-    <script>
-        function gotoProject(uuid, environment) {
-            if (!environment) {
-                window.location.href = '/project/' + uuid;
-            }
-            window.location.href = '/project/' + uuid + '/' + environment;
-        }
-    </script>
-    {{-- <x-forms.button wire:click='getIptables'>Get IPTABLES</x-forms.button> --}}
+            @endif
+        </section>
+    </div>
 </div>

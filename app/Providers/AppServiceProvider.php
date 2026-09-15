@@ -2,22 +2,69 @@
 
 namespace App\Providers;
 
-use App\Models\InstanceSettings;
 use App\Models\PersonalAccessToken;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\App;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\View;
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Validation\Rules\Password;
 use Laravel\Sanctum\Sanctum;
+use Stripe\StripeClient;
 
 class AppServiceProvider extends ServiceProvider
 {
-    public function register(): void {}
+    public function register(): void
+    {
+        $this->app->bind(StripeClient::class, fn () => new StripeClient(config('subscription.stripe_api_key')));
+    }
 
     public function boot(): void
     {
-        Sanctum::usePersonalAccessTokenModel(PersonalAccessToken::class);
+        $this->configureCommands();
 
-        Http::macro('github', function (string $api_url, ?string $github_access_token = null) {
+        $this->configureModels();
+        $this->configurePasswords();
+        $this->configureSanctumModel();
+        $this->configureGitHubHttp();
+
+    }
+
+    private function configureCommands(): void
+    {
+        if (App::isProduction()) {
+            DB::prohibitDestructiveCommands();
+        }
+    }
+
+    private function configureModels(): void
+    {
+        // Disabled because it's causing issues with the application
+        // Model::shouldBeStrict();
+    }
+
+    private function configurePasswords(): void
+    {
+        Password::defaults(function () {
+            return App::isProduction()
+                ? Password::min(8)
+                    ->mixedCase()
+                    ->letters()
+                    ->numbers()
+                    ->symbols()
+                    ->uncompromised()
+                : Password::min(8)->letters();
+        });
+    }
+
+    private function configureSanctumModel(): void
+    {
+        Sanctum::usePersonalAccessTokenModel(PersonalAccessToken::class);
+    }
+
+    private function configureGitHubHttp(): void
+    {
+        Http::macro('GitHub', function (string $api_url, ?string $github_access_token = null) {
             if ($github_access_token) {
                 return Http::withHeaders([
                     'X-GitHub-Api-Version' => '2022-11-28',
@@ -30,9 +77,16 @@ class AppServiceProvider extends ServiceProvider
                 ])->baseUrl($api_url);
             }
         });
-        // if (! env('CI')) {
-        //     View::share('instanceSettings', InstanceSettings::get());
-        // }
 
+        Http::macro('GitLab', function (string $api_url, ?string $access_token = null) {
+            $client = Http::withHeaders([
+                'Accept' => 'application/json',
+            ])->baseUrl($api_url);
+            if ($access_token) {
+                $client = $client->withToken($access_token);
+            }
+
+            return $client;
+        });
     }
 }

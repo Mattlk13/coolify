@@ -4,10 +4,12 @@ namespace App\Actions\CoolifyTask;
 
 use App\Enums\ActivityTypes;
 use App\Enums\ProcessStatus;
+use App\Helpers\SshMultiplexingHelper;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Server;
 use Illuminate\Process\ProcessResult;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
 use Spatie\Activitylog\Models\Activity;
 
@@ -38,7 +40,6 @@ class RunRemoteProcess
      */
     public function __construct(Activity $activity, bool $hide_from_output = false, bool $ignore_errors = false, $call_event_on_finish = null, $call_event_data = null)
     {
-
         if ($activity->getExtraProperty('type') !== ActivityTypes::INLINE->value && $activity->getExtraProperty('type') !== ActivityTypes::COMMAND->value) {
             throw new \RuntimeException('Incompatible Activity to run a remote command.');
         }
@@ -84,22 +85,14 @@ class RunRemoteProcess
         ]);
 
         $processResult = $process->wait();
-        // $processResult = Process::timeout($timeout)->run($this->getCommand(), $this->handleOutput(...));
         if ($this->activity->properties->get('status') === ProcessStatus::ERROR->value) {
             $status = ProcessStatus::ERROR;
         } else {
             if ($processResult->exitCode() == 0) {
                 $status = ProcessStatus::FINISHED;
-            }
-            if ($processResult->exitCode() != 0 && ! $this->ignore_errors) {
+            } else {
                 $status = ProcessStatus::ERROR;
             }
-            // if (($processResult->exitCode() == 0 && $this->is_finished) || $this->activity->properties->get('status') === ProcessStatus::FINISHED->value) {
-            //     $status = ProcessStatus::FINISHED;
-            // }
-            // if ($processResult->exitCode() != 0 && !$this->ignore_errors) {
-            //     $status = ProcessStatus::ERROR;
-            // }
         }
 
         $this->activity->properties = $this->activity->properties->merge([
@@ -109,23 +102,20 @@ class RunRemoteProcess
             'status' => $status->value,
         ]);
         $this->activity->save();
-        if ($processResult->exitCode() != 0 && ! $this->ignore_errors) {
-            throw new \RuntimeException($processResult->errorOutput(), $processResult->exitCode());
-        }
         if ($this->call_event_on_finish) {
             try {
-                if ($this->call_event_data) {
-                    event(resolve("App\\Events\\$this->call_event_on_finish", [
-                        'data' => $this->call_event_data,
-                    ]));
+                $eventClass = "App\\Events\\$this->call_event_on_finish";
+                if (! is_null($this->call_event_data)) {
+                    event(new $eventClass($this->call_event_data));
                 } else {
-                    event(resolve("App\\Events\\$this->call_event_on_finish", [
-                        'userId' => $this->activity->causer_id,
-                    ]));
+                    event(new $eventClass($this->activity->causer_id));
                 }
             } catch (\Throwable $e) {
-                ray($e);
+                Log::error('Error calling event: '.$e->getMessage());
             }
+        }
+        if ($processResult->exitCode() != 0 && ! $this->ignore_errors) {
+            throw new \RuntimeException($processResult->errorOutput(), $processResult->exitCode());
         }
 
         return $processResult;
@@ -137,7 +127,7 @@ class RunRemoteProcess
         $command = $this->activity->getExtraProperty('command');
         $server = Server::whereUuid($server_uuid)->firstOrFail();
 
-        return generateSshCommand($server, $command);
+        return SshMultiplexingHelper::generateSshCommand($server, $command);
     }
 
     protected function handleOutput(string $type, string $output)

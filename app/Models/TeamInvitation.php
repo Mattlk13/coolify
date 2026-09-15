@@ -15,21 +15,41 @@ class TeamInvitation extends Model
         'via',
     ];
 
+    /**
+     * Set the email attribute to lowercase.
+     */
+    public function setEmailAttribute(string $value): void
+    {
+        $this->attributes['email'] = strtolower($value);
+    }
+
     public function team()
     {
         return $this->belongsTo(Team::class);
     }
 
-    public function isValid()
+    public static function ownedByCurrentTeam()
     {
-        $createdAt = $this->created_at;
-        $diff = $createdAt->diffInMinutes(now());
-        if ($diff <= config('constants.invitation.link.expiration')) {
+        return TeamInvitation::whereTeamId(currentTeam()->id);
+    }
+
+    public function isValid(): bool
+    {
+        if (! $this->hasExpired()) {
             return true;
         } else {
             $this->delete();
+            $user = User::whereEmail($this->email)->first();
+            if (filled($user)) {
+                $user->deleteIfNotVerifiedAndForcePasswordReset();
+            }
 
             return false;
         }
+    }
+
+    public function hasExpired(): bool
+    {
+        return $this->created_at->diffInDays(now()) > config('constants.invitation.link.expiration_days');
     }
 }

@@ -3,12 +3,15 @@
 namespace App\Livewire\Project\Shared;
 
 use App\Models\Tag;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Attributes\Validate;
 use Livewire\Component;
 
 // Refactored ✅
 class Tags extends Component
 {
+    use AuthorizesRequests;
+
     public $resource = null;
 
     #[Validate('required|string|min:2')]
@@ -34,9 +37,11 @@ class Tags extends Component
     public function submit()
     {
         try {
+            $this->authorize('update', $this->resource);
             $this->validate();
             $tags = str($this->newTags)->trim()->explode(' ');
             foreach ($tags as $tag) {
+                $tag = strip_tags($tag);
                 if (strlen($tag) < 2) {
                     $this->dispatch('error', 'Invalid tag.', "Tag <span class='dark:text-warning'>$tag</span> is invalid. Min length is 2.");
 
@@ -65,6 +70,8 @@ class Tags extends Component
     public function addTag(string $id, string $name)
     {
         try {
+            $this->authorize('update', $this->resource);
+            $name = strip_tags($name);
             if ($this->resource->tags()->where('id', $id)->exists()) {
                 $this->dispatch('error', 'Duplicate tags.', "Tag <span class='dark:text-warning'>$name</span> already added.");
 
@@ -81,11 +88,10 @@ class Tags extends Component
     public function deleteTag(string $id)
     {
         try {
+            $this->authorize('update', $this->resource);
             $this->resource->tags()->detach($id);
             $found_more_tags = Tag::ownedByCurrentTeam()->find($id);
-            if ($found_more_tags && $found_more_tags->applications()->count() == 0 && $found_more_tags->services()->count() == 0) {
-                $found_more_tags->delete();
-            }
+            $found_more_tags?->deleteIfOrphaned();
             $this->refresh();
             $this->dispatch('success', 'Tag deleted.');
         } catch (\Exception $e) {

@@ -2,16 +2,32 @@
 
 namespace App\Livewire\Project\Shared\ScheduledTask;
 
+use App\Models\Application;
+use App\Models\ScheduledTask;
+use App\Models\Service;
+use App\Models\StandalonePostgresql;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Support\Collection;
+use Livewire\Attributes\Locked;
 use Livewire\Component;
 
 class Add extends Component
 {
+    use AuthorizesRequests;
+
     public $parameters;
 
+    #[Locked]
+    public string $id;
+
+    #[Locked]
     public string $type;
 
+    #[Locked]
     public Collection $containerNames;
+
+    #[Locked]
+    public $resource;
 
     public string $name;
 
@@ -21,13 +37,14 @@ class Add extends Component
 
     public ?string $container = '';
 
-    protected $listeners = ['clearScheduledTask' => 'clear'];
+    public int $timeout = 300;
 
     protected $rules = [
         'name' => 'required|string',
         'command' => 'required|string',
         'frequency' => 'required|string',
         'container' => 'nullable|string',
+        'timeout' => 'required|integer|min:60|max:36000',
     ];
 
     protected $validationAttributes = [
@@ -35,11 +52,28 @@ class Add extends Component
         'command' => 'command',
         'frequency' => 'frequency',
         'container' => 'container',
+        'timeout' => 'timeout',
     ];
 
     public function mount()
     {
         $this->parameters = get_route_parameters();
+
+        // Get the resource based on type and id
+        switch ($this->type) {
+            case 'application':
+                $this->resource = Application::ownedByCurrentTeam()->findOrFail($this->id);
+                break;
+            case 'service':
+                $this->resource = Service::ownedByCurrentTeam()->findOrFail($this->id);
+                break;
+            case 'standalone-postgresql':
+                $this->resource = StandalonePostgresql::ownedByCurrentTeam()->findOrFail($this->id);
+                break;
+            default:
+                throw new \Exception('Invalid resource type');
+        }
+
         if ($this->containerNames->count() > 0) {
             $this->container = $this->containerNames->first();
         }
@@ -48,6 +82,7 @@ class Add extends Component
     public function submit()
     {
         try {
+            $this->authorize('update', $this->resource);
             $this->validate();
             $isValid = validate_cron_expression($this->frequency);
             if (! $isValid) {
@@ -55,20 +90,45 @@ class Add extends Component
 
                 return;
             }
-            if (empty($this->container) || $this->container == 'null') {
-                if ($this->type == 'service') {
+            if (empty($this->container) || $this->container === 'null') {
+                if ($this->type === 'service') {
                     $this->container = $this->subServiceName;
                 }
             }
-            $this->dispatch('saveScheduledTask', [
-                'name' => $this->name,
-                'command' => $this->command,
-                'frequency' => $this->frequency,
-                'container' => $this->container,
-            ]);
+            $this->saveScheduledTask();
             $this->clear();
         } catch (\Exception $e) {
             return handleError($e, $this);
+        }
+    }
+
+    private function saveScheduledTask(): void
+    {
+        try {
+            $task = new ScheduledTask;
+            $task->name = $this->name;
+            $task->command = $this->command;
+            $task->frequency = $this->frequency;
+            $task->container = $this->container;
+            $task->timeout = $this->timeout;
+            $task->team_id = currentTeam()->id;
+
+            switch ($this->type) {
+                case 'application':
+                    $task->application_id = $this->id;
+                    break;
+                case 'standalone-postgresql':
+                    $task->standalone_postgresql_id = $this->id;
+                    break;
+                case 'service':
+                    $task->service_id = $this->id;
+                    break;
+            }
+            $task->save();
+            $this->dispatch('refreshTasks');
+            $this->dispatch('success', 'Scheduled task added.');
+        } catch (\Throwable $e) {
+            handleError($e, $this);
         }
     }
 
@@ -78,5 +138,6 @@ class Add extends Component
         $this->command = '';
         $this->frequency = '';
         $this->container = '';
+        $this->timeout = 300;
     }
 }

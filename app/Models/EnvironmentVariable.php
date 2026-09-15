@@ -3,11 +3,10 @@
 namespace App\Models;
 
 use App\Models\EnvironmentVariable as ModelsEnvironmentVariable;
+use App\Support\ValidationPatterns;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
-use Illuminate\Database\Eloquent\Model;
 use OpenApi\Attributes as OA;
-use Symfony\Component\Yaml\Yaml;
-use Visus\Cuid2\Cuid2;
 
 #[OA\Schema(
     description: 'Environment Variable model',
@@ -15,71 +14,147 @@ use Visus\Cuid2\Cuid2;
     properties: [
         'id' => ['type' => 'integer'],
         'uuid' => ['type' => 'string'],
-        'application_id' => ['type' => 'integer'],
-        'service_id' => ['type' => 'integer'],
-        'database_id' => ['type' => 'integer'],
-        'is_build_time' => ['type' => 'boolean'],
+        'resourceable_type' => ['type' => 'string'],
+        'resourceable_id' => ['type' => 'integer'],
         'is_literal' => ['type' => 'boolean'],
         'is_multiline' => ['type' => 'boolean'],
         'is_preview' => ['type' => 'boolean'],
+        'is_runtime' => ['type' => 'boolean'],
+        'is_buildtime' => ['type' => 'boolean'],
         'is_shared' => ['type' => 'boolean'],
         'is_shown_once' => ['type' => 'boolean'],
         'key' => ['type' => 'string'],
         'value' => ['type' => 'string'],
         'real_value' => ['type' => 'string'],
+        'comment' => ['type' => 'string', 'nullable' => true],
         'version' => ['type' => 'string'],
         'created_at' => ['type' => 'string'],
         'updated_at' => ['type' => 'string'],
     ]
 )]
-class EnvironmentVariable extends Model
+class EnvironmentVariable extends BaseModel
 {
-    protected $guarded = [];
+    public const BUILDPACK_CONTROL_VARIABLE_PREFIXES = ['NIXPACKS_', 'RAILPACK_'];
+
+    protected $attributes = [
+        'is_runtime' => true,
+        'is_buildtime' => true,
+    ];
+
+    protected $fillable = [
+        // Core identification
+        'key',
+        'value',
+        'comment',
+
+        // Polymorphic relationship
+        'resourceable_type',
+        'resourceable_id',
+
+        // Boolean flags
+        'is_preview',
+        'is_multiline',
+        'is_literal',
+        'is_runtime',
+        'is_buildtime',
+        'is_shown_once',
+        'is_shared',
+        'is_required',
+
+        // Metadata
+        'version',
+        'order',
+    ];
 
     protected $casts = [
         'key' => 'string',
         'value' => 'encrypted',
-        'is_build_time' => 'boolean',
         'is_multiline' => 'boolean',
         'is_preview' => 'boolean',
+        'is_runtime' => 'boolean',
+        'is_buildtime' => 'boolean',
         'version' => 'string',
+        'resourceable_type' => 'string',
+        'resourceable_id' => 'integer',
     ];
 
-    protected $appends = ['real_value', 'is_shared'];
+    protected $appends = ['real_value', 'is_shared', 'is_really_required', 'is_buildpack_control', 'is_coolify'];
+
+    /**
+     * Sensitive fields hidden by default in serialized output (toArray/toJson).
+     * API controllers should call makeVisible([...]) for callers with the
+     * `read:sensitive` or `root` token ability.
+     */
+    protected $hidden = [
+        'value',
+        'real_value',
+    ];
 
     protected static function booted()
     {
-        static::creating(function (Model $model) {
-            if (! $model->uuid) {
-                $model->uuid = (string) new Cuid2;
-            }
-        });
-        static::created(function (EnvironmentVariable $environment_variable) {
-            if ($environment_variable->application_id && ! $environment_variable->is_preview) {
-                $found = ModelsEnvironmentVariable::where('key', $environment_variable->key)->where('application_id', $environment_variable->application_id)->where('is_preview', true)->first();
+        static::created(function (ModelsEnvironmentVariable $environment_variable) {
+            if ($environment_variable->resourceable_type === Application::class && ! $environment_variable->is_preview) {
+                $found = ModelsEnvironmentVariable::where('key', $environment_variable->key)
+                    ->where('resourceable_type', Application::class)
+                    ->where('resourceable_id', $environment_variable->resourceable_id)
+                    ->where('is_preview', true)
+                    ->first();
+
                 if (! $found) {
-                    $application = Application::find($environment_variable->application_id);
-                    if ($application->build_pack !== 'dockerfile') {
+                    $application = Application::find($environment_variable->resourceable_id);
+                    if ($application) {
                         ModelsEnvironmentVariable::create([
                             'key' => $environment_variable->key,
                             'value' => $environment_variable->value,
-                            'is_build_time' => $environment_variable->is_build_time,
                             'is_multiline' => $environment_variable->is_multiline ?? false,
-                            'application_id' => $environment_variable->application_id,
+                            'is_literal' => $environment_variable->is_literal ?? false,
+                            'is_runtime' => $environment_variable->is_runtime ?? false,
+                            'is_buildtime' => $environment_variable->is_buildtime ?? false,
+                            'comment' => $environment_variable->comment,
+                            'resourceable_type' => Application::class,
+                            'resourceable_id' => $environment_variable->resourceable_id,
                             'is_preview' => true,
                         ]);
                     }
                 }
             }
             $environment_variable->update([
-                'version' => config('version'),
+                'version' => config('constants.coolify.version'),
             ]);
+        });
+
+        static::saving(function (ModelsEnvironmentVariable $environmentVariable) {
+            $environmentVariable->updateIsShared();
         });
     }
 
     public function service()
     {
         return $this->belongsTo(Service::class);
+    }
+
+    public function scopeWithoutBuildpackControlVariables(Builder $query): Builder
+    {
+        foreach (self::BUILDPACK_CONTROL_VARIABLE_PREFIXES as $prefix) {
+            $query->where('key', 'not like', "{$prefix}%");
+        }
+
+        return $query;
+    }
+
+    public static function isBuildpackControlKey(?string $key): bool
+    {
+        if (blank($key)) {
+            return false;
+        }
+
+        foreach (self::BUILDPACK_CONTROL_VARIABLE_PREFIXES as $prefix) {
+            if (str($key)->startsWith($prefix)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     protected function value(): Attribute
@@ -90,91 +165,83 @@ class EnvironmentVariable extends Model
         );
     }
 
+    /**
+     * Get the parent resourceable model.
+     */
+    public function resourceable()
+    {
+        return $this->morphTo();
+    }
+
     public function resource()
     {
-        $resource = null;
-        if ($this->application_id) {
-            $resource = Application::find($this->application_id);
-        } elseif ($this->service_id) {
-            $resource = Service::find($this->service_id);
-        } elseif ($this->database_id) {
-            $resource = getResourceByUuid($this->parameters['database_uuid'], data_get(auth()->user()->currentTeam(), 'id'));
-        }
-
-        return $resource;
+        return $this->resourceable;
     }
 
     public function realValue(): Attribute
     {
-        $resource = $this->resource();
-
         return Attribute::make(
-            get: function () use ($resource) {
-                $env = $this->get_real_environment_variables($this->value, $resource);
-
-                return data_get($env, 'value', $env);
-                if (is_string($env)) {
-                    return $env;
+            get: function () {
+                if (! $this->relationLoaded('resourceable')) {
+                    $this->load('resourceable');
+                }
+                $resource = $this->resourceable;
+                if (! $resource) {
+                    return null;
                 }
 
-                return $env->value;
+                // Load relationships needed for shared variable resolution
+                if (! $resource->relationLoaded('environment')) {
+                    $resource->load('environment');
+                }
+                if (! $resource->relationLoaded('server') && method_exists($resource, 'server')) {
+                    $resource->load('server');
+                }
+                if (! $resource->relationLoaded('destination') && method_exists($resource, 'destination')) {
+                    $resource->load('destination.server');
+                }
+
+                $real_value = $this->get_real_environment_variables($this->value, $resource);
+
+                // Skip escaping for valid JSON objects/arrays to prevent quote corruption (see #6160)
+                if (json_validate($real_value) && (str_starts_with($real_value, '{') || str_starts_with($real_value, '['))) {
+                    return $real_value;
+                }
+
+                if ($this->is_literal || $this->is_multiline) {
+                    $real_value = '\''.$real_value.'\'';
+                } else {
+                    $real_value = escapeEnvVariables($real_value);
+                }
+
+                return $real_value;
             }
         );
     }
 
-    protected function isFoundInCompose(): Attribute
+    protected function isReallyRequired(): Attribute
+    {
+        return Attribute::make(
+            get: fn () => $this->is_required && str($this->real_value)->isEmpty(),
+        );
+    }
+
+    protected function isBuildpackControl(): Attribute
+    {
+        return Attribute::make(
+            get: fn () => self::isBuildpackControlKey($this->key),
+        );
+    }
+
+    protected function isCoolify(): Attribute
     {
         return Attribute::make(
             get: function () {
-                if (! $this->application_id) {
+                if (str($this->key)->startsWith('SERVICE_')) {
                     return true;
                 }
-                $found_in_compose = false;
-                $found_in_args = false;
-                $resource = $this->resource();
-                $compose = data_get($resource, 'docker_compose_raw');
-                if (! $compose) {
-                    return true;
-                }
-                $yaml = Yaml::parse($compose);
-                $services = collect(data_get($yaml, 'services'));
-                if ($services->isEmpty()) {
-                    return false;
-                }
-                foreach ($services as $service) {
-                    $environments = collect(data_get($service, 'environment'));
-                    $args = collect(data_get($service, 'build.args'));
-                    if ($environments->isEmpty() && $args->isEmpty()) {
-                        $found_in_compose = false;
-                        break;
-                    }
 
-                    $found_in_compose = $environments->contains(function ($item) {
-                        if (str($item)->contains('=')) {
-                            $item = str($item)->before('=');
-                        }
-
-                        return strpos($item, $this->key) !== false;
-                    });
-
-                    if ($found_in_compose) {
-                        break;
-                    }
-
-                    $found_in_args = $args->contains(function ($item) {
-                        if (str($item)->contains('=')) {
-                            $item = str($item)->before('=');
-                        }
-
-                        return strpos($item, $this->key) !== false;
-                    });
-
-                    if ($found_in_args) {
-                        break;
-                    }
-                }
-
-                return $found_in_compose || $found_in_args;
+                return false;
             }
         );
     }
@@ -193,10 +260,57 @@ class EnvironmentVariable extends Model
         );
     }
 
+    public function get_real_environment_variables_with_server(?string $environment_variable = null, $resource = null, $server = null)
+    {
+        return $this->get_real_environment_variables_internal($environment_variable, $resource, $server);
+    }
+
+    public function getResolvedValueWithServer($server = null)
+    {
+        if (! $this->relationLoaded('resourceable')) {
+            $this->load('resourceable');
+        }
+        $resource = $this->resourceable;
+        if (! $resource) {
+            return null;
+        }
+
+        // Load relationships needed for shared variable resolution
+        if (! $resource->relationLoaded('environment')) {
+            $resource->load('environment');
+        }
+        if (! $resource->relationLoaded('server') && method_exists($resource, 'server')) {
+            $resource->load('server');
+        }
+        if (! $resource->relationLoaded('destination') && method_exists($resource, 'destination')) {
+            $resource->load('destination.server');
+        }
+
+        $real_value = $this->get_real_environment_variables_internal($this->value, $resource, $server);
+
+        // Skip escaping for valid JSON objects/arrays to prevent quote corruption (see #6160)
+        if (json_validate($real_value) && (str_starts_with($real_value, '{') || str_starts_with($real_value, '['))) {
+            return $real_value;
+        }
+
+        if ($this->is_literal || $this->is_multiline) {
+            $real_value = '\''.$real_value.'\'';
+        } else {
+            $real_value = escapeEnvVariables($real_value);
+        }
+
+        return $real_value;
+    }
+
     private function get_real_environment_variables(?string $environment_variable = null, $resource = null)
     {
-        if ((is_null($environment_variable) && $environment_variable == '') || is_null($resource)) {
-            return null;
+        return $this->get_real_environment_variables_internal($environment_variable, $resource);
+    }
+
+    private function get_real_environment_variables_internal(?string $environment_variable = null, $resource = null, $serverOverride = null)
+    {
+        if (is_null($environment_variable) || $environment_variable === '' || is_null($resource)) {
+            return $environment_variable;
         }
         $environment_variable = trim($environment_variable);
         $sharedEnvsFound = str($environment_variable)->matchAll('/{{(.*?)}}/');
@@ -204,24 +318,37 @@ class EnvironmentVariable extends Model
             return $environment_variable;
         }
         foreach ($sharedEnvsFound as $sharedEnv) {
-            $type = str($sharedEnv)->match('/(.*?)\./');
+            $type = str($sharedEnv)->trim()->match('/(.*?)\./');
             if (! collect(SHARED_VARIABLE_TYPES)->contains($type)) {
                 continue;
             }
-            $variable = str($sharedEnv)->match('/\.(.*)/');
+            $variable = str($sharedEnv)->trim()->match('/\.(.*)/');
+            $id = null;
             if ($type->value() === 'environment') {
                 $id = $resource->environment->id;
             } elseif ($type->value() === 'project') {
                 $id = $resource->environment->project->id;
             } elseif ($type->value() === 'team') {
                 $id = $resource->team()->id;
+            } elseif ($type->value() === 'server') {
+                if ($serverOverride) {
+                    $id = $serverOverride->id;
+                } elseif (isset($resource->server) && $resource->server) {
+                    $id = $resource->server->id;
+                } elseif (isset($resource->destination) && $resource->destination && isset($resource->destination->server)) {
+                    $id = $resource->destination->server->id;
+                }
             }
             if (is_null($id)) {
                 continue;
             }
-            $environment_variable_found = SharedEnvironmentVariable::where('type', $type)->where('key', $variable)->where('team_id', $resource->team()->id)->where("{$type}_id", $id)->first();
-            if ($environment_variable_found) {
-                $environment_variable = str($environment_variable)->replace("{{{$sharedEnv}}}", $environment_variable_found->value);
+            $found = SharedEnvironmentVariable::where('type', $type)
+                ->where('key', $variable)
+                ->where('team_id', $resource->team()->id)
+                ->where("{$type}_id", $id)
+                ->first();
+            if ($found) {
+                $environment_variable = str($environment_variable)->replace("{{{$sharedEnv}}}", $found->value);
             }
         }
 
@@ -239,13 +366,13 @@ class EnvironmentVariable extends Model
 
     private function set_environment_variables(?string $environment_variable = null): ?string
     {
-        if (is_null($environment_variable) && $environment_variable == '') {
+        if (is_null($environment_variable)) {
             return null;
         }
         $environment_variable = trim($environment_variable);
         $type = str($environment_variable)->after('{{')->before('.')->value;
         if (str($environment_variable)->startsWith('{{'.$type) && str($environment_variable)->endsWith('}}')) {
-            return encrypt((string) str($environment_variable)->replace(' ', ''));
+            return encrypt($environment_variable);
         }
 
         return encrypt($environment_variable);
@@ -254,7 +381,16 @@ class EnvironmentVariable extends Model
     protected function key(): Attribute
     {
         return Attribute::make(
-            set: fn (string $value) => str($value)->trim()->replace(' ', '_')->value,
+            set: fn (string $value) => ValidationPatterns::validatedEnvironmentVariableKey(
+                ValidationPatterns::normalizeEnvironmentVariableKey($value)
+            ),
         );
+    }
+
+    protected function updateIsShared(): void
+    {
+        $type = str($this->value)->after('{{')->before('.')->value;
+        $isShared = str($this->value)->startsWith('{{'.$type) && str($this->value)->endsWith('}}');
+        $this->is_shared = $isShared;
     }
 }

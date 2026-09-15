@@ -1,20 +1,23 @@
 <div class="w-full">
     @if ($label)
-        <label class="flex items-center gap-1 mb-1 text-sm font-medium">{{ $label }}
-            @if ($required)
-                <x-highlighted text="*" />
-            @endif
+        <div class="mb-1.5 flex h-4 w-full items-center gap-1.5">
+            <label
+                class="mb-0! flex items-center gap-1 text-sm font-medium leading-4 {{ $disabled ? 'text-neutral-600' : '' }}">{{ $label }}
+                @if ($required)
+                    <x-highlighted text="*" />
+                @endif
+            </label>
             @if ($helper)
                 <x-helper :helper="$helper" />
             @endif
-        </label>
+        </div>
     @endif
-    <select {{ $attributes->merge(['class' => $defaultClass]) }} @required($required) wire:dirty.class.remove='dark:focus:ring-coolgray-300 dark:ring-coolgray-300'
-        wire:dirty.class="dark:focus:ring-warning dark:ring-warning" wire:loading.attr="disabled" name={{ $id }}
-        @if ($attributes->whereStartsWith('wire:model')->first()) {{ $attributes->whereStartsWith('wire:model')->first() }} @else wire:model={{ $id }} @endif>
+    <select {{ $attributes->merge(['class' => $defaultClass]) }} @disabled($disabled) @required($required)
+        wire:loading.attr="disabled" name={{ $modelBinding }} id="{{ $htmlId }}"
+        @if ($attributes->whereStartsWith('wire:model')->first()) {{ $attributes->whereStartsWith('wire:model')->first() }} wire:dirty.class="[box-shadow:inset_4px_0_0_#6b16ed,inset_0_0_0_2px_#e5e5e5] dark:[box-shadow:inset_4px_0_0_#fcd452,inset_0_0_0_2px_#242424]" @else wire:model={{ $modelBinding }} wire:dirty.class="[box-shadow:inset_4px_0_0_#6b16ed,inset_0_0_0_2px_#e5e5e5] dark:[box-shadow:inset_4px_0_0_#fcd452,inset_0_0_0_2px_#242424]" @endif>
         {{ $slot }}
     </select>
-    @error($id)
+    @error($modelBinding)
         <label class="label">
             <span class="text-red-500 label-text-alt">{{ $message }}</span>
         </label>

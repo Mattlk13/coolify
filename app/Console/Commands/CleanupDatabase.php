@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\DB;
 
 class CleanupDatabase extends Command
 {
-    protected $signature = 'cleanup:database {--yes}';
+    protected $signature = 'cleanup:database {--yes} {--keep-days=}';
 
     protected $description = 'Cleanup database';
 
@@ -20,9 +20,9 @@ class CleanupDatabase extends Command
         }
         if (isCloud()) {
             // Later on we can increase this to 180 days or dynamically set
-            $keep_days = 60;
+            $keep_days = $this->option('keep-days') ?? 60;
         } else {
-            $keep_days = 60;
+            $keep_days = $this->option('keep-days') ?? 60;
         }
         echo "Keep days: $keep_days\n";
         // Cleanup failed jobs table
@@ -57,13 +57,12 @@ class CleanupDatabase extends Command
             $application_deployment_queues->delete();
         }
 
-        // Cleanup webhooks table
-        $webhooks = DB::table('webhooks')->where('created_at', '<', now()->subDays($keep_days));
-        $count = $webhooks->count();
-        echo "Delete $count entries from webhooks.\n";
+        // Cleanup scheduled_task_executions table
+        $scheduled_task_executions = DB::table('scheduled_task_executions')->where('created_at', '<', now()->subDays($keep_days))->orderBy('created_at', 'desc');
+        $count = $scheduled_task_executions->count();
+        echo "Delete $count entries from scheduled_task_executions.\n";
         if ($this->option('yes')) {
-            $webhooks->delete();
+            $scheduled_task_executions->delete();
         }
-
     }
 }

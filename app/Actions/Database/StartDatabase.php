@@ -11,10 +11,16 @@ use App\Models\StandaloneMysql;
 use App\Models\StandalonePostgresql;
 use App\Models\StandaloneRedis;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 
 class StartDatabase
 {
     use AsAction;
+
+    public function configureJob(JobDecorator $job): void
+    {
+        $job->onQueue(deployment_queue());
+    }
 
     public function handle(StandaloneRedis|StandalonePostgresql|StandaloneMongodb|StandaloneMysql|StandaloneMariadb|StandaloneKeydb|StandaloneDragonfly|StandaloneClickhouse $database)
     {
@@ -22,29 +28,34 @@ class StartDatabase
         if (! $server->isFunctional()) {
             return 'Server is not functional';
         }
+        $database->update([
+            'restart_count' => 0,
+            'last_restart_at' => null,
+            'last_restart_type' => null,
+        ]);
         switch ($database->getMorphClass()) {
-            case 'App\Models\StandalonePostgresql':
+            case StandalonePostgresql::class:
                 $activity = StartPostgresql::run($database);
                 break;
-            case 'App\Models\StandaloneRedis':
+            case StandaloneRedis::class:
                 $activity = StartRedis::run($database);
                 break;
-            case 'App\Models\StandaloneMongodb':
+            case StandaloneMongodb::class:
                 $activity = StartMongodb::run($database);
                 break;
-            case 'App\Models\StandaloneMysql':
+            case StandaloneMysql::class:
                 $activity = StartMysql::run($database);
                 break;
-            case 'App\Models\StandaloneMariadb':
+            case StandaloneMariadb::class:
                 $activity = StartMariadb::run($database);
                 break;
-            case 'App\Models\StandaloneKeydb':
+            case StandaloneKeydb::class:
                 $activity = StartKeydb::run($database);
                 break;
-            case 'App\Models\StandaloneDragonfly':
+            case StandaloneDragonfly::class:
                 $activity = StartDragonfly::run($database);
                 break;
-            case 'App\Models\StandaloneClickhouse':
+            case StandaloneClickhouse::class:
                 $activity = StartClickhouse::run($database);
                 break;
         }

@@ -2,120 +2,182 @@
     <x-slot:title>
         Notifications | Coolify
     </x-slot>
-    <x-notification.navbar />
-    <form wire:submit='submit' class="flex flex-col gap-4 pb-4">
-        <div class="flex items-center gap-2">
-            <h2>Email</h2>
-            <x-forms.button type="submit">
-                Save
-            </x-forms.button>
-            @if (isInstanceAdmin() && !$team->use_instance_email_settings)
-                <x-forms.button wire:click='copyFromInstanceSettings'>
-                    Copy from Instance Settings
-                </x-forms.button>
-            @endif
-            @if (isEmailEnabled($team) && auth()->user()->isAdminFromSession() && isTestEmailEnabled($team))
-                <x-modal-input buttonTitle="Send Test Email" title="Send Test Email">
-                    <form wire:submit='submit' class="flex flex-col w-full gap-2">
-                        <x-forms.input placeholder="test@example.com" id="emails" label="Recipients" required />
-                        <x-forms.button wire:click="sendTestNotification" @click="modalOpen=false">
-                            Send Email
-                        </x-forms.button>
-                    </form>
-                </x-modal-input>
-            @endif
-        </div>
-    </form>
-    @if (isCloud())
-        @if ($this->sharedEmailEnabled)
-            <div class="w-64 py-4">
-                <x-forms.checkbox instantSave="instantSaveInstance" id="team.use_instance_email_settings"
-                    label="Use Hosted Email Service" />
+
+    <x-notification.settings-layout>
+    <div class="flex flex-col gap-6">
+        <form wire:submit="submit" class="application-settings-form">
+            <x-unsaved-bar action="submit" />
+            <x-application.settings-section title="Email delivery">
+                <x-slot:actions>
+                    @if (auth()->user()->isAdminFromSession())
+                        @can('sendTest', $settings)
+                            @if ($team->isNotificationEnabled('email'))
+                                <x-modal-input title="Send Test Email">
+                                    <x-slot:content>
+                                        <button type="button" class="button">
+                                            <x-reicon name="notifications" class="size-3.5" />
+                                            Send test
+                                        </button>
+                                    </x-slot:content>
+                                    <form wire:submit.prevent="sendTestEmail" class="flex w-full flex-col gap-4">
+                                        <x-forms.input wire:model="testEmailAddress" placeholder="test@example.com"
+                                            id="testEmailAddress" label="Recipient" required />
+                                        <div class="flex justify-end border-t border-neutral-200 pt-4 dark:border-white/[0.08]">
+                                            <button type="submit" @click="modalOpen=false"
+                                                class="button button-highlighted">
+                                                Send email
+                                            </button>
+                                        </div>
+                                    </form>
+                                </x-modal-input>
+                            @else
+                                <button type="button" class="button" disabled>Send test</button>
+                            @endif
+                        @endcan
+                    @endif
+                </x-slot:actions>
+
+                <div class="grid gap-4 lg:grid-cols-2">
+                    <div class="lg:col-span-2">
+                        @if (isCloud())
+                            <div class="w-full sm:w-72">
+                                <x-forms.listbox canGate="update" :canResource="$settings" id="useInstanceEmailSettings" label="Email service"
+                                    onChange="instantSave"
+                                    :disabled="!auth()->user()->can('update', $settings)" :options="[
+                                        ['value' => true, 'label' => 'Use hosted email service'],
+                                        ['value' => false, 'label' => 'Use team email settings'],
+                                    ]" />
+                            </div>
+                        @else
+                            <div class="w-full sm:w-72">
+                                <x-forms.listbox canGate="update" :canResource="$settings" id="useInstanceEmailSettings" label="Email service"
+                                    onChange="instantSave"
+                                    :disabled="!auth()->user()->can('update', $settings)" :options="[
+                                        ['value' => true, 'label' => 'Use system-wide settings'],
+                                        ['value' => false, 'label' => 'Use team email settings'],
+                                    ]" />
+                            </div>
+                        @endif
+                    </div>
+
+                    @if (!$useInstanceEmailSettings)
+                        <x-forms.input canGate="update" :canResource="$settings" required id="smtpFromName"
+                            helper="Name used in emails." label="From name" />
+                        <x-forms.input canGate="update" :canResource="$settings" required id="smtpFromAddress"
+                            helper="Email address used in emails." label="From address" />
+
+                        @if (isInstanceAdmin())
+                            <div class="lg:col-span-2">
+                                <x-forms.button type="button" wire:click="copyFromInstanceSettings">
+                                    Copy from instance settings
+                                </x-forms.button>
+                            </div>
+                        @endif
+                    @endif
+                </div>
+            </x-application.settings-section>
+        </form>
+
+        @if (!$useInstanceEmailSettings)
+            <div class="application-settings-form">
+                <x-application.settings-section title="SMTP server"
+                    description="Deliver messages through your own SMTP server.">
+                    <div class="grid gap-4 lg:grid-cols-3">
+                        <div class="lg:col-span-3">
+                            <div class="w-full sm:w-72">
+                                <x-forms.listbox canGate="update" :canResource="$settings" id="smtpEnabled" label="SMTP delivery"
+                                    onChange="submitSmtp"
+                                    :disabled="!auth()->user()->can('update', $settings)" :options="[
+                                        ['value' => true, 'label' => 'Enabled'],
+                                        ['value' => false, 'label' => 'Disabled'],
+                                    ]" />
+                            </div>
+                        </div>
+                        <x-forms.input canGate="update" :canResource="$settings" required id="smtpHost"
+                            placeholder="smtp.mailgun.org" label="Host" />
+                        <x-forms.input canGate="update" :canResource="$settings" required id="smtpPort"
+                            type="number" placeholder="587" label="Port" />
+                        <x-forms.listbox canGate="update" :canResource="$settings" id="smtpEncryption" label="Encryption" required
+                            :disabled="!auth()->user()->can('update', $settings)" :options="[
+                            ['value' => 'starttls', 'label' => 'StartTLS'],
+                            ['value' => 'tls', 'label' => 'TLS / SSL'],
+                            ['value' => 'none', 'label' => 'None'],
+                        ]" />
+                        <x-forms.input canGate="update" :canResource="$settings" id="smtpUsername"
+                            label="SMTP username" />
+                        @can('update', $settings)
+                            <x-forms.input canGate="update" :canResource="$settings" id="smtpPassword" type="password"
+                                label="SMTP password" />
+                        @else
+                            <x-forms.input disabled label="SMTP password" value="Hidden (only admins can view)" />
+                        @endcan
+                        <x-forms.input canGate="update" :canResource="$settings" id="smtpTimeout" type="number"
+                            helper="Timeout value for sending emails." label="Timeout" />
+                        <x-forms.input canGate="update" :canResource="$settings" id="smtpEhloDomain"
+                            placeholder="coolify.example.com"
+                            helper="Fully qualified domain sent in the SMTP EHLO command. Uses the system default when empty."
+                            label="EHLO domain" />
+                    </div>
+                </x-application.settings-section>
             </div>
-        @else
-            <div class="w-96 pb-4">
-                <x-forms.checkbox disabled id="team.use_instance_email_settings"
-                    label="Use Hosted Email Service (Pro+ subscription required)" />
+
+            <div class="application-settings-form">
+                <x-application.settings-section title="Resend">
+                    <div class="grid gap-4 lg:grid-cols-2">
+                        <x-forms.listbox canGate="update" :canResource="$settings" id="resendEnabled" label="Resend delivery"
+                            onChange="submitResend"
+                            :disabled="!auth()->user()->can('update', $settings)" :options="[
+                                ['value' => true, 'label' => 'Enabled'],
+                                ['value' => false, 'label' => 'Disabled'],
+                            ]" />
+                        @can('update', $settings)
+                            <x-forms.input canGate="update" :canResource="$settings" :required="$resendEnabled"
+                                type="password" id="resendApiKey" placeholder="API key" label="API key"
+                                autocomplete="new-password" />
+                        @else
+                            <x-forms.input disabled label="API key" value="Hidden (only admins can view)" />
+                        @endcan
+                    </div>
+                </x-application.settings-section>
             </div>
         @endif
-    @else
-        <div class="w-96">
-            <x-forms.checkbox instantSave="instantSaveInstance" id="team.use_instance_email_settings"
-                label="Use system wide (transactional) email settings" />
-        </div>
-    @endif
-    @if (!$team->use_instance_email_settings)
-        <form class="flex flex-col items-end gap-2 pt-4 pb-4 xl:flex-row" wire:submit='submitFromFields'>
-            <x-forms.input required id="team.smtp_from_name" helper="Name used in emails." label="From Name" />
-            <x-forms.input required id="team.smtp_from_address" helper="Email address used in emails."
-                label="From Address" />
-            <x-forms.button type="submit">
-                Save
-            </x-forms.button>
-        </form>
-        <div class="flex flex-col gap-4">
-            <div class="p-4 border dark:border-coolgray-300">
-                <h3>SMTP Server</h3>
-                <div class="w-32">
-                    <x-forms.checkbox instantSave id="team.smtp_enabled" label="Enabled" />
+
+        <div class="application-settings-form">
+            <x-application.settings-section title="Notification events">
+                <div class="grid gap-4 lg:grid-cols-2">
+                    <x-notification.event-multiselect :settings="$settings" id="deployment-email-events" label="Deployments"
+                        :events="[
+                            ['property' => 'deploymentSuccessEmailNotifications', 'label' => 'Deployment success', 'enabled' => $deploymentSuccessEmailNotifications],
+                            ['property' => 'deploymentFailureEmailNotifications', 'label' => 'Deployment failure', 'enabled' => $deploymentFailureEmailNotifications],
+                        ]" />
+                    <x-notification.event-multiselect :settings="$settings" id="resource-email-events" label="Resources"
+                        :events="[
+                            ['property' => 'statusChangeEmailNotifications', 'label' => 'Resource status changes', 'enabled' => $statusChangeEmailNotifications],
+                            ['property' => 'restartLimitReachedEmailNotifications', 'label' => 'Restart limit reached', 'enabled' => $restartLimitReachedEmailNotifications],
+                        ]" />
+                    <x-notification.event-multiselect :settings="$settings" id="backup-email-events" label="Backups"
+                        :events="[
+                            ['property' => 'backupSuccessEmailNotifications', 'label' => 'Backup success', 'enabled' => $backupSuccessEmailNotifications],
+                            ['property' => 'backupFailureEmailNotifications', 'label' => 'Backup failure', 'enabled' => $backupFailureEmailNotifications],
+                        ]" />
+                    <x-notification.event-multiselect :settings="$settings" id="scheduled-task-email-events"
+                        label="Scheduled tasks" :events="[
+                            ['property' => 'scheduledTaskSuccessEmailNotifications', 'label' => 'Scheduled task success', 'enabled' => $scheduledTaskSuccessEmailNotifications],
+                            ['property' => 'scheduledTaskFailureEmailNotifications', 'label' => 'Scheduled task failure', 'enabled' => $scheduledTaskFailureEmailNotifications],
+                        ]" />
+                    <x-notification.event-multiselect :settings="$settings" id="server-email-events" label="Server"
+                        :events="[
+                            ['property' => 'dockerCleanupSuccessEmailNotifications', 'label' => 'Docker cleanup success', 'enabled' => $dockerCleanupSuccessEmailNotifications],
+                            ['property' => 'dockerCleanupFailureEmailNotifications', 'label' => 'Docker cleanup failure', 'enabled' => $dockerCleanupFailureEmailNotifications],
+                            ['property' => 'serverDiskUsageEmailNotifications', 'label' => 'Server disk usage', 'enabled' => $serverDiskUsageEmailNotifications],
+                            ['property' => 'serverReachableEmailNotifications', 'label' => 'Server reachable', 'enabled' => $serverReachableEmailNotifications],
+                            ['property' => 'serverUnreachableEmailNotifications', 'label' => 'Server unreachable', 'enabled' => $serverUnreachableEmailNotifications],
+                            ['property' => 'serverPatchEmailNotifications', 'label' => 'Server patching', 'enabled' => $serverPatchEmailNotifications],
+                            ['property' => 'traefikOutdatedEmailNotifications', 'label' => 'Traefik proxy outdated', 'enabled' => $traefikOutdatedEmailNotifications],
+                        ]" />
                 </div>
-                <form wire:submit='submit' class="flex flex-col">
-                    <div class="flex flex-col gap-4">
-                        <div class="flex flex-col w-full gap-2 xl:flex-row">
-                            <x-forms.input required id="team.smtp_host" placeholder="smtp.mailgun.org" label="Host" />
-                            <x-forms.input required id="team.smtp_port" placeholder="587" label="Port" />
-                            <x-forms.input id="team.smtp_encryption" helper="If SMTP uses SSL, set it to 'tls'."
-                                placeholder="tls" label="Encryption" />
-                        </div>
-                        <div class="flex flex-col w-full gap-2 xl:flex-row">
-                            <x-forms.input id="team.smtp_username" label="SMTP Username" />
-                            <x-forms.input id="team.smtp_password" type="password" label="SMTP Password" />
-                            <x-forms.input id="team.smtp_timeout" helper="Timeout value for sending emails."
-                                label="Timeout" />
-                        </div>
-                    </div>
-                    <div class="flex justify-end gap-4 pt-6">
-                        <x-forms.button type="submit">
-                            Save
-                        </x-forms.button>
-                    </div>
-                </form>
-            </div>
-            <div class="p-4 border dark:border-coolgray-300">
-                <h3>Resend</h3>
-                <div class="w-32">
-                    <x-forms.checkbox instantSave='instantSaveResend' id="team.resend_enabled" label="Enabled" />
-                </div>
-                <form wire:submit='submitResend' class="flex flex-col">
-                    <div class="flex flex-col gap-4">
-                        <div class="flex flex-col w-full gap-2 xl:flex-row">
-                            <x-forms.input required type="password" id="team.resend_api_key" placeholder="API key"
-                                label="API Key" />
-                        </div>
-                    </div>
-                    <div class="flex justify-end gap-4 pt-6">
-                        <x-forms.button type="submit">
-                            Save
-                        </x-forms.button>
-                    </div>
-                </form>
-            </div>
+            </x-application.settings-section>
         </div>
-    @endif
-    @if (isEmailEnabled($team) || data_get($team, 'use_instance_email_settings'))
-        <h2 class="mt-4">Subscribe to events</h2>
-        <div class="w-64">
-            @if (isDev())
-                <x-forms.checkbox instantSave="saveModel" id="team.smtp_notifications_test" label="Test" />
-            @endif
-            <x-forms.checkbox instantSave="saveModel" id="team.smtp_notifications_status_changes"
-                label="Container Status Changes" />
-            <x-forms.checkbox instantSave="saveModel" id="team.smtp_notifications_deployments"
-                label="Application Deployments" />
-            <x-forms.checkbox instantSave="saveModel" id="team.smtp_notifications_database_backups"
-                label="Backup Status" />
-            <x-forms.checkbox instantSave="saveModel" id="team.smtp_notifications_scheduled_tasks"
-                label="Scheduled Tasks Status" />
-        </div>
-    @endif
+    </div>
+    </x-notification.settings-layout>
 </div>

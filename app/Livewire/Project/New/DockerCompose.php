@@ -5,12 +5,14 @@ namespace App\Livewire\Project\New;
 use App\Models\EnvironmentVariable;
 use App\Models\Project;
 use App\Models\Service;
-use Illuminate\Support\Str;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
 use Symfony\Component\Yaml\Yaml;
 
 class DockerCompose extends Component
 {
+    use AuthorizesRequests;
+
     public string $dockerComposeRaw = '';
 
     public string $envFile = '';
@@ -24,63 +26,66 @@ class DockerCompose extends Component
         $this->parameters = get_route_parameters();
         $this->query = request()->query();
         if (isDev()) {
-            $this->dockerComposeRaw = 'services:
-            appsmith:
-              build:
-                context: .
-                dockerfile_inline: |
-                  FROM nginx
-                  ARG GIT_COMMIT
-                  ARG GIT_BRANCH
-                  RUN echo "Hello World ${GIT_COMMIT} ${GIT_BRANCH}"
-                args:
-                  - GIT_COMMIT=cdc3b19
-                  - GIT_BRANCH=${GIT_BRANCH}
-              environment:
-                - APPSMITH_MAIL_ENABLED=${APPSMITH_MAIL_ENABLED}
-          ';
+            $this->dockerComposeRaw = file_get_contents(base_path('templates/test-database-detection.yaml'));
         }
     }
 
     public function submit()
     {
-        $server_id = $this->query['server_id'];
         try {
+            $this->authorize('create', Service::class);
+
             $this->validate([
                 'dockerComposeRaw' => 'required',
             ]);
             $this->dockerComposeRaw = Yaml::dump(Yaml::parse($this->dockerComposeRaw), 10, 2, Yaml::DUMP_MULTI_LINE_LITERAL_BLOCK);
 
-            $isValid = validateComposeFile($this->dockerComposeRaw, $server_id);
-            if ($isValid !== 'OK') {
-                return $this->dispatch('error', "Invalid docker-compose file.\n$isValid");
-            }
+            // Validate for command injection BEFORE saving to database
+            validateDockerComposeForInjection($this->dockerComposeRaw);
 
-            $project = Project::where('uuid', $this->parameters['project_uuid'])->first();
-            $environment = $project->load(['environments'])->environments->where('name', $this->parameters['environment_name'])->first();
-            $service = Service::create([
-                'name' => 'service'.Str::random(10),
+            $project = Project::ownedByCurrentTeam()->where('uuid', $this->parameters['project_uuid'])->firstOrFail();
+            $environment = $project->environments()->where('uuid', $this->parameters['environment_uuid'])->firstOrFail();
+
+            $destination_uuid = $this->query['destination'] ?? null;
+            $destination = find_resource_destination_for_current_team($destination_uuid);
+            if (! $destination) {
+                throw new \Exception('Destination not found.');
+            }
+            $destination_class = $destination->getMorphClass();
+
+            $service = new Service([
                 'docker_compose_raw' => $this->dockerComposeRaw,
                 'environment_id' => $environment->id,
-                'server_id' => (int) $server_id,
+                'server_id' => $destination->server_id,
+                'destination_id' => $destination->id,
+                'destination_type' => $destination_class,
             ]);
+            $service->save();
+
             $variables = parseEnvFormatToArray($this->envFile);
-            foreach ($variables as $key => $variable) {
+            foreach ($variables as $key => $data) {
+                // Extract value and comment from parsed data
+                // Handle both array format ['value' => ..., 'comment' => ...] and plain string values
+                $value = is_array($data) ? ($data['value'] ?? '') : $data;
+                $comment = is_array($data) ? ($data['comment'] ?? null) : null;
+
                 EnvironmentVariable::create([
                     'key' => $key,
-                    'value' => $variable,
-                    'is_build_time' => false,
+                    'value' => $value,
+                    'comment' => $comment,
                     'is_preview' => false,
-                    'service_id' => $service->id,
+                    'resourceable_id' => $service->id,
+                    'resourceable_type' => $service->getMorphClass(),
                 ]);
             }
-            $service->name = "service-$service->uuid";
-
             $service->parse(isNew: true);
+
+            // Apply service-specific application prerequisites
+            applyServiceApplicationPrerequisites($service);
 
             return redirect()->route('project.service.configuration', [
                 'service_uuid' => $service->uuid,
-                'environment_name' => $environment->name,
+                'environment_uuid' => $environment->uuid,
                 'project_uuid' => $project->uuid,
             ]);
         } catch (\Throwable $e) {

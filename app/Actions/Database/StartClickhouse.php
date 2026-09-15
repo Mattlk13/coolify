@@ -24,7 +24,7 @@ class StartClickhouse
         $this->configuration_dir = database_configuration_dir().'/'.$container_name;
 
         $this->commands = [
-            "echo 'Starting {$database->name}.'",
+            "echo 'Starting database.'",
             "mkdir -p $this->configuration_dir",
         ];
 
@@ -49,16 +49,10 @@ class StartClickhouse
                             'hard' => 262144,
                         ],
                     ],
-                    'labels' => [
-                        'coolify.managed' => 'true',
-                    ],
-                    'healthcheck' => [
-                        'test' => "clickhouse-client --password {$this->database->clickhouse_admin_password} --query 'SELECT 1'",
-                        'interval' => '5s',
-                        'timeout' => '5s',
-                        'retries' => 10,
-                        'start_period' => '5s',
-                    ],
+                    'labels' => defaultDatabaseLabels($this->database)->toArray(),
+                    'healthcheck' => $this->database->healthCheckConfiguration([
+                        'CMD', 'clickhouse-client', '--user', (string) $this->database->clickhouse_admin_user, '--password', (string) $this->database->clickhouse_admin_password, '--query', 'SELECT 1',
+                    ]),
                     'mem_limit' => $this->database->limits_memory,
                     'memswap_limit' => $this->database->limits_memory_swap,
                     'mem_swappiness' => $this->database->limits_memory_swappiness,
@@ -79,14 +73,7 @@ class StartClickhouse
             data_set($docker_compose, "services.{$container_name}.cpuset", $this->database->limits_cpuset);
         }
         if ($this->database->destination->server->isLogDrainEnabled() && $this->database->isLogDrainEnabled()) {
-            $docker_compose['services'][$container_name]['logging'] = [
-                'driver' => 'fluentd',
-                'options' => [
-                    'fluentd-address' => 'tcp://127.0.0.1:24224',
-                    'fluentd-async' => 'true',
-                    'fluentd-sub-second-precision' => 'true',
-                ],
-            ];
+            $docker_compose['services'][$container_name]['logging'] = generate_fluentd_configuration();
         }
         if (count($this->database->ports_mappings_array) > 0) {
             $docker_compose['services'][$container_name]['ports'] = $this->database->ports_mappings_array;
@@ -102,6 +89,14 @@ class StartClickhouse
         if (count($volume_names) > 0) {
             $docker_compose['volumes'] = $volume_names;
         }
+
+        // Add custom docker run options
+        $docker_run_options = convertDockerRunToCompose($this->database->custom_docker_run_options);
+        $docker_compose = generateCustomDockerRunOptionsForDatabases($docker_run_options, $docker_compose, $container_name, $this->database->destination->network);
+
+        if (! $this->database->isHealthcheckEnabled()) {
+            unset($docker_compose['services'][$container_name]['healthcheck']);
+        }
         $docker_compose = Yaml::dump($docker_compose, 10);
         $docker_compose_base64 = base64_encode($docker_compose);
         $this->commands[] = "echo '{$docker_compose_base64}' | base64 -d | tee $this->configuration_dir/docker-compose.yml > /dev/null";
@@ -109,6 +104,8 @@ class StartClickhouse
         $this->commands[] = "echo '{$readme}' > $this->configuration_dir/README.md";
         $this->commands[] = "echo 'Pulling {$database->image} image.'";
         $this->commands[] = "docker compose -f $this->configuration_dir/docker-compose.yml pull";
+        $this->commands[] = dockerStopCommand(10, $container_name, $this->database->destination->server).' 2>/dev/null || true';
+        $this->commands[] = "docker rm -f $container_name 2>/dev/null || true";
         $this->commands[] = "docker compose -f $this->configuration_dir/docker-compose.yml up -d";
         $this->commands[] = "echo 'Database started.'";
 
@@ -154,13 +151,19 @@ class StartClickhouse
             $environment_variables->push("$env->key=$env->real_value");
         }
 
-        if ($environment_variables->filter(fn ($env) => str($env)->contains('CLICKHOUSE_ADMIN_USER'))->isEmpty()) {
-            $environment_variables->push("CLICKHOUSE_ADMIN_USER={$this->database->clickhouse_admin_user}");
+        if ($environment_variables->filter(fn ($env) => str($env)->contains('CLICKHOUSE_USER'))->isEmpty()) {
+            $environment_variables->push("CLICKHOUSE_USER={$this->database->clickhouse_admin_user}");
         }
 
-        if ($environment_variables->filter(fn ($env) => str($env)->contains('CLICKHOUSE_ADMIN_PASSWORD'))->isEmpty()) {
-            $environment_variables->push("CLICKHOUSE_ADMIN_PASSWORD={$this->database->clickhouse_admin_password}");
+        if ($environment_variables->filter(fn ($env) => str($env)->contains('CLICKHOUSE_PASSWORD'))->isEmpty()) {
+            $environment_variables->push("CLICKHOUSE_PASSWORD={$this->database->clickhouse_admin_password}");
         }
+
+        if ($environment_variables->filter(fn ($env) => str($env)->contains('CLICKHOUSE_DB'))->isEmpty()) {
+            $environment_variables->push("CLICKHOUSE_DB={$this->database->clickhouse_db}");
+        }
+
+        add_coolify_default_environment_variables($this->database, $environment_variables, $environment_variables);
 
         return $environment_variables->all();
     }
